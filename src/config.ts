@@ -9,6 +9,7 @@ export interface FoxConfig {
   host: string;
   apiKey: string;
   model: string; // 已剥离 [1m] 标注的干净模型名，可直接发给 API
+  fallbackModel?: string; // FOXAGENT_FALLBACK_MODEL：上游重试耗尽后的备用模型
   numCtx: number;
   temperature: number;
   maxIters: number;
@@ -56,10 +57,13 @@ export function loadConfig(): FoxConfig {
   // 不带标注时取 NUM_CTX（没设就 200k）
   const { model: cleanModel, window: modelWindow } = parseModel(model!);
   const defaultCtx = num("FOXAGENT_NUM_CTX", DEFAULT_WINDOW, 2048, 10_000_000);
+  // 备用模型同样剥 [1m] 标注；它的窗口不参与压缩阈值（阈值按主模型算，偏保守无害）
+  const fallbackRaw = process.env.FOXAGENT_FALLBACK_MODEL;
   return {
     host: host!,
     apiKey: apiKey!,
     model: cleanModel,
+    fallbackModel: fallbackRaw ? parseModel(fallbackRaw).model : undefined,
     numCtx: modelWindow > DEFAULT_WINDOW ? modelWindow : defaultCtx,
     temperature: num("FOXAGENT_TEMPERATURE", 0.3, 0, 2),
     maxIters: num("FOXAGENT_MAX_ITERS", 25, 1, 1000),

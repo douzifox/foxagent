@@ -27,6 +27,7 @@ export interface AgentOptions extends ToolIO {
   host: string;
   apiKey: string;
   model: string;
+  fallbackModel?: string; // 上游重试耗尽后的备用模型（FOXAGENT_FALLBACK_MODEL）
   numCtx: number; // 仅用于上下文压缩阈值
   temperature: number;
   maxIters: number;
@@ -86,22 +87,32 @@ export async function chatOnce(
   const url = base.endsWith("/v1")
     ? `${base}/chat/completions`
     : `${base}/v1/chat/completions`;
-  const res = await fetch(url, {
-    method: "POST",
-    signal,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: cfg.model,
-      messages: messages.map(toOpenAI),
-      temperature: cfg.temperature,
-      ...(withTools ? { tools: TOOLS } : {}),
-      ...(onDelta ? { stream: true } : {}),
-    }),
-  });
-  if (!res.ok) throw new Error(`接口返回 ${res.status}：${await res.text()}`);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: messages.map(toOpenAI),
+        temperature: cfg.temperature,
+        ...(withTools ? { tools: TOOLS } : {}),
+        ...(onDelta ? { stream: true } : {}),
+      }),
+    });
+  } catch (e: any) {
+    if (e?.name !== "AbortError") e.retryable = true; // 网络层错误（连接被拒/DNS/断流）值得重试
+    throw e;
+  }
+  if (!res.ok) {
+    const err: any = new Error(`接口返回 ${res.status}：${await res.text()}`);
+    err.status = res.status; // 给重试层判断用
+    throw err;
+  }
 
   if (!onDelta) {
     const data: any = await res.json();
@@ -206,6 +217,81 @@ export async function chatOnce(
   return out;
 }
 
+// ---- 上游重试 ----
+// 503/429/网络抖动是常态，不重试就翻车（MCP 指挥实战里第二次任务因 503 颗粒无收）。
+// 指数退避 3 次；耗尽后若配了 FOXAGENT_FALLBACK_MODEL 就换备用模型再试一轮。
+const RETRY_DELAYS = [2000, 8000, 30000];
+
+function isRetryable(e: any): boolean {
+  if (e?.name === "AbortError") return false;
+  if (e?.retryable) return true;
+  return [429, 500, 502, 503, 504].includes(e?.status);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      const e: any = new Error("aborted");
+      e.name = "AbortError";
+      reject(e);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+interface RetryIO {
+  onEvent: (e: AgentEvent) => void;
+  signal?: AbortSignal;
+  fallbackModel?: string;
+}
+
+export async function chatWithRetry(
+  cfg: ModelConfig,
+  io: RetryIO,
+  messages: ChatMessage[],
+  withTools: boolean,
+  onDelta?: (kind: "text" | "thinking", text: string) => void
+): Promise<ChatMessage> {
+  const models = [cfg.model];
+  if (io.fallbackModel && io.fallbackModel !== cfg.model) models.push(io.fallbackModel);
+  // 流式已经吐过增量的失败不能重试——重放会让调用方看到重复内容
+  let emitted = false;
+  const wrapDelta = onDelta
+    ? (kind: "text" | "thinking", text: string) => {
+        emitted = true;
+        onDelta(kind, text);
+      }
+    : undefined;
+  let lastErr: any;
+  for (let mi = 0; mi < models.length; mi++) {
+    for (let attempt = 0; ; attempt++) {
+      emitted = false;
+      try {
+        return await chatOnce({ ...cfg, model: models[mi] }, messages, withTools, wrapDelta, io.signal);
+      } catch (e: any) {
+        lastErr = e;
+        if (e?.name === "AbortError" || emitted || !isRetryable(e)) throw e;
+        if (attempt >= RETRY_DELAYS.length) break; // 本模型重试耗尽，看有没有备用
+        const delay = RETRY_DELAYS[attempt];
+        io.onEvent({
+          type: "status",
+          text: `上游繁忙（${e.status ?? "网络错误"}），${delay / 1000} 秒后重试 ${attempt + 1}/${RETRY_DELAYS.length}…`,
+        });
+        await sleep(delay, io.signal);
+      }
+    }
+    if (mi + 1 < models.length) {
+      io.onEvent({ type: "status", text: `重试耗尽，换备用模型 ${models[mi + 1]} 再试…` });
+    }
+  }
+  throw lastErr;
+}
+
 // 失败判定的唯一来源——journal 标注和 pitfall 记录共用，避免两处结论矛盾
 function isFailedOutput(output: string): boolean {
   return (
@@ -243,7 +329,12 @@ async function wrapUp(
   for (let i = 0; i < 5; i++) {
     let msg: ChatMessage;
     try {
-      msg = await chatOnce(cfg, wrapMessages, true);
+      msg = await chatWithRetry(
+        cfg,
+        { onEvent: opts.onEvent, signal: opts.signal, fallbackModel: opts.fallbackModel },
+        wrapMessages,
+        true
+      );
     } catch {
       return; // 收尾失败不影响主任务
     }
@@ -300,8 +391,9 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
       numCtx: opts.numCtx,
       onEvent,
       complete: async (prompt) => {
-        const m = await chatOnce(
+        const m = await chatWithRetry(
           { ...cfg, temperature: 0.1 },
+          { onEvent, signal: opts.signal, fallbackModel: opts.fallbackModel },
           [{ role: "user", content: prompt }],
           false
         );
@@ -317,15 +409,15 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
     let msg: ChatMessage;
     let sawDelta = false;
     try {
-      msg = await chatOnce(
+      msg = await chatWithRetry(
         cfg,
+        { onEvent, signal: opts.signal, fallbackModel: opts.fallbackModel },
         messages,
         true,
         (kind, text) => {
           sawDelta = true;
           onEvent({ type: "delta", kind, text });
-        },
-        opts.signal
+        }
       );
     } catch (e: any) {
       if (sawDelta) onEvent({ type: "delta_end" });
