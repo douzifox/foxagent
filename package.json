@@ -53,6 +53,7 @@
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "check": "tsc --noEmit",
+    "package": "bun run build && npx @vscode/vsce package --no-dependencies",
     "cli": "bun src/cli.ts",
     "cli:compile": "bun build --compile src/cli.ts --outfile foxagent",
     "cli:compile:win": "bun build --compile --target=bun-windows-x64 src/cli.ts --outfile foxagent.exe"
