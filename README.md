@@ -13,7 +13,9 @@
 
 ## 配置
 
-只认环境变量，密钥不落任何文件。
+以环境变量为主；缺失时兜底读 `~/.config/foxagent/env`（KEY=VALUE 每行一条，
+环境变量优先）——GUI 启动的进程（MCP 服务器、双击打开的 VS Code）读不到
+shell 配置时靠它。密钥红线：不进项目目录。
 
 ```bash
 # 必须（写进 ~/.zshrc 或 Windows 系统环境变量）
@@ -25,6 +27,7 @@ export FOXAGENT_MODEL=deepseek-v4-flash          # 模型名，见下方窗口�
 export FOXAGENT_NUM_CTX=120000     # 覆盖默认的压缩阈值（见下方说明）
 export FOXAGENT_TEMPERATURE=0.3
 export FOXAGENT_MAX_ITERS=25
+export FOXAGENT_FALLBACK_MODEL=deepseek-chat   # 上游重试耗尽后的备用模型
 ```
 
 ### 模型窗口约定
@@ -72,9 +75,30 @@ Ctrl+C        退出（自动保存）
 输入回车      干活时排队，本轮结束后自动发送
 
 # 非交互模式（供其他 agent 调用）
-bun src/cli.ts -p "任务描述"            # 干完退出，退出码 0=成功 1=出错
-bun src/cli.ts -p "后续指令" --continue  # 续最近会话
+bun src/cli.ts -p "任务描述"                 # 干完退出
+bun src/cli.ts -p "后续指令" --continue       # 续最近会话
+bun src/cli.ts -p "后续指令" --session <id>   # 续指定会话（并行任务不串线）
 ```
+
+`-p` 模式与调用方双向沟通：危险命令确认、模型的 ask 提问会打一行
+`@@ASK@@{...}` 到 stdout 并等 stdin 一行回复（没人接就当拒绝/不在线）。
+结束时输出一行 `@@RESULT@@{outcome, filesChanged, committed, error, sessionId}`
+结构化摘要——成果与事故分开呈现。退出码：0 = 有成果（包括干完活才翻车的
+部分成功），1 = 颗粒无收。
+
+## MCP 服务器（被 Claude Code 等指挥）
+
+注册成全局 MCP 后，任何 MCP 客户端都能派活给 FoxAgent：
+
+```bash
+claude mcp add --scope user foxagent -- bun ~/Cli/src/mcp.ts
+# 密钥三件套写进 ~/.claude.json 里 foxagent 的 env 字段，或用兜底文件
+```
+
+三个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId）→
+`fox_status`（轮询增量输出；state=waiting_for_input 时带 question）→
+`fox_reply`（回答提问，任务继续）。任务表只在内存，MCP 服务器重启即失效。
+完整轨迹落在 `~/.foxagent/projects/<路径>/runs/<taskId>.log`。
 
 编译成单文件（不依赖 bun/node，拷走就能跑）：
 
@@ -95,6 +119,7 @@ bun run cli:compile:win    # 交叉编译 Windows → foxagent.exe
     memory/MEMORY.md                       项目记忆索引（注入）
     memory/<slug>.md                       每条记忆一个文件（按需读）
     journal.md                             工作档案（全文注入）
+    runs/<taskId>.log                      MCP 任务的完整轨迹
 ```
 
 CLI 和插件读写同一份——终端开的工可以到编辑器里接着干。

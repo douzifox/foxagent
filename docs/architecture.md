@@ -35,8 +35,35 @@ runAgent 通过 `onEvent` 单向推事件，入口层各自渲染：
 ## ToolIO 解耦
 
 工具层不知道界面是谁：需要用户点头的操作走 `confirmCommand`（只有危险命令），
-diff 展示走 `showEdit`（通知性，不阻塞）。CLI 实现为终端问答/打印，
-插件实现为弹窗/面板消息，`-p` 模式实现为自动拒绝+打印。
+diff 展示走 `showEdit`（通知性，不阻塞），模型主动提问走 `askUser`（ask 工具，
+可缺省——没接线时如实告诉模型「指挥者不在线」）。CLI 实现为终端问答/打印，
+插件实现为弹窗/输入框，`-p` 模式实现为哨兵协议（见下）。
+
+## -p 模式哨兵协议 + MCP 服务器（mcp.ts）
+
+`-p` 模式与调用方之间用 stdout/stdin 走行协议：
+
+```
+@@ASK@@{"type":"confirm"|"ask","question":...}   需要回答：危险命令确认 / ask 提问
+                                                  ← stdin 一行回复（confirm 用 y/yes）
+@@RESULT@@{outcome, filesChanged, committed,      结束时的结构化摘要：
+           error, sessionId}                      成果与事故分离呈现
+```
+
+stdin 无人接（EOF）→ 确认当拒绝、提问当不在线，如实汇报。
+退出码：0 = 有成果（含收尾翻车的部分成功），1 = 颗粒无收。
+
+mcp.ts 把这层包成 MCP 三工具（按行 JSON 的 JSON-RPC，手写无 SDK）：
+`fox_submit`（spawn 子进程立即返回 taskId）→ `fox_status`（增量输出，
+单次 ≤8k 字符，hasMore 提示继续取；哨兵行转成 waiting_for_input 状态）
+→ `fox_reply`（写回子进程 stdin）。任务表仅内存，服务器进程没了任务即不存在。
+完整轨迹落 `runs/<taskId>.log`，MCP 端只回传增量与摘要。
+
+## 上游重试（agent.ts chatWithRetry）
+
+503/429/5xx/网络错误指数退避重试 3 次（2s→8s→30s），每次发 status 事件；
+流式已吐过增量的失败不重试（重放会重复输出）。重试耗尽后若配了
+`FOXAGENT_FALLBACK_MODEL` 换备用模型再试一轮。主循环、压缩、收尾轮都走这层。
 
 ## 数据落盘（~/.foxagent/，见 src/paths.ts）
 
@@ -47,6 +74,7 @@ diff 展示走 `showEdit`（通知性，不阻塞）。CLI 实现为终端问答
     memory/<slug>.md                       每条记忆一个文件（按需读）
     sessions/<id>.json                     会话（含 pending journal 暂存）
     journal.md                             工作档案（任务粒度，全文注入）
+    runs/<taskId>.log                      MCP 任务的完整轨迹（mcp.ts 写）
 ```
 
 项目路径编码：`root.replace(/[\/\\:]/g, "-")`。项目目录本身零污染。
