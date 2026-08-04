@@ -1,7 +1,11 @@
-// 配置只从环境变量读，密钥不落任何配置文件。
+// 配置以环境变量为主，缺失时兜底读 ~/.config/foxagent/env（KEY=VALUE，环境变量优先）。
+// 密钥红线是不进项目目录；主目录配置可落盘（决策 4 修订）。
 // 必须：FOXAGENT_HOST、FOXAGENT_API_KEY、FOXAGENT_MODEL
 // 可选：FOXAGENT_NUM_CTX（压缩阈值，默认按模型窗口推断）、FOXAGENT_TEMPERATURE（默认 0.3）、
-//       FOXAGENT_MAX_ITERS（默认 25）
+//       FOXAGENT_MAX_ITERS（默认 25）、FOXAGENT_FALLBACK_MODEL（上游重试耗尽后的备用模型）
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 //
 // 模型窗口约定（网关侧）：模型名默认 200k 上下文；1M 窗口的模型名带 [1m] 后缀，
 // 例如 "deepseek-v4-flash[1m]"。这个后缀只是给客户端看的标记，发给 API 前必须剥离。
@@ -25,10 +29,29 @@ export function parseModel(raw: string): { model: string; window: number } {
   return { model: raw.trim(), window: DEFAULT_WINDOW };
 }
 
+// 兜底文件：GUI 启动的进程（MCP 服务器、双击打开的 VS Code）读不到 shell 配置，
+// 环境变量断链时从这里救。格式：每行 KEY=VALUE，# 开头是注释
+function loadEnvFallback(): Record<string, string> {
+  const out: Record<string, string> = {};
+  try {
+    const text = fs.readFileSync(path.join(os.homedir(), ".config", "foxagent", "env"), "utf-8");
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const eq = t.indexOf("=");
+      if (eq <= 0) continue;
+      out[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+    }
+  } catch {}
+  return out;
+}
+
 export function loadConfig(): FoxConfig {
-  const host = process.env.FOXAGENT_HOST;
-  const apiKey = process.env.FOXAGENT_API_KEY;
-  const model = process.env.FOXAGENT_MODEL;
+  const fallback = loadEnvFallback();
+  const get = (name: string) => process.env[name] || fallback[name];
+  const host = get("FOXAGENT_HOST");
+  const apiKey = get("FOXAGENT_API_KEY");
+  const model = get("FOXAGENT_MODEL");
   const missing = [
     !host && "FOXAGENT_HOST",
     !apiKey && "FOXAGENT_API_KEY",
@@ -39,12 +62,14 @@ export function loadConfig(): FoxConfig {
       `缺少环境变量：${missing.join("、")}。请在 shell 配置（如 ~/.zshrc）里设置，例如：\n` +
         `export FOXAGENT_HOST=https://api.deepseek.com\n` +
         `export FOXAGENT_API_KEY=sk-xxx\n` +
-        `export FOXAGENT_MODEL=deepseek-chat`
+        `export FOXAGENT_MODEL=deepseek-chat\n` +
+        `如果通过 MCP 调用，请在 MCP 注册配置的 env 字段里设置；\n` +
+        `GUI 启动读不到 shell 配置时，也可写入兜底文件 ~/.config/foxagent/env（KEY=VALUE 每行一条）`
     );
   }
   // 数值环境变量：拼错（NaN）或超范围时报错，不静默用怪值
   const num = (name: string, def: number, min: number, max: number): number => {
-    const raw = process.env[name];
+    const raw = get(name);
     if (raw === undefined || raw === "") return def;
     const v = Number(raw);
     if (!Number.isFinite(v) || v < min || v > max) {
@@ -58,7 +83,7 @@ export function loadConfig(): FoxConfig {
   const { model: cleanModel, window: modelWindow } = parseModel(model!);
   const defaultCtx = num("FOXAGENT_NUM_CTX", DEFAULT_WINDOW, 2048, 10_000_000);
   // 备用模型同样剥 [1m] 标注；它的窗口不参与压缩阈值（阈值按主模型算，偏保守无害）
-  const fallbackRaw = process.env.FOXAGENT_FALLBACK_MODEL;
+  const fallbackRaw = get("FOXAGENT_FALLBACK_MODEL");
   return {
     host: host!,
     apiKey: apiKey!,
