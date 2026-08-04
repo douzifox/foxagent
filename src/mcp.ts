@@ -47,6 +47,11 @@ const TOOLS = [
       properties: {
         task: { type: "string", description: "任务描述（会作为用户消息发给 FoxAgent）" },
         cwd: { type: "string", description: "工作目录（FoxAgent 在哪个项目里干活），必须是绝对路径" },
+        session: {
+          type: "string",
+          description:
+            "显式会话 id（任务结束时 result.sessionId 里返回）。想接着某次会话继续就传它；多任务并行时别用 continueSession，会串线",
+        },
         continueSession: { type: "boolean", description: "是否续上最近一次会话（默认 false，开新会话）" },
       },
       required: ["task", "cwd"],
@@ -156,7 +161,8 @@ function submitTask(args: any): { ok: true; taskId: string; logPath: string } | 
   const logPath = path.join(runsDir, `${taskId}.log`);
 
   const cliArgs = [CLI_PATH, "-p", task];
-  if (args?.continueSession) cliArgs.push("--continue");
+  if (args?.session) cliArgs.push("--session", String(args.session));
+  else if (args?.continueSession) cliArgs.push("--continue");
   const child = spawn("bun", cliArgs, {
     cwd,
     env: { ...process.env },

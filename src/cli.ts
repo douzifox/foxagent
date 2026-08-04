@@ -41,7 +41,7 @@ function colorDiff(diffText: string): string {
 // -p 单任务模式：给程序（比如 Claude Code 经由 mcp.ts）调用的非交互入口。
 // 双向沟通走哨兵协议：需要确认/提问时向 stdout 打一行 @@ASK@@{...}，
 // 然后等 stdin 的一行回复。没人接（stdin 已关/EOF）→ 当作拒绝/不在线，如实汇报。
-async function runOnce(task: string, continueSession: boolean) {
+async function runOnce(task: string, continueSession: boolean, sessionId?: string) {
   let config;
   try {
     config = loadConfig();
@@ -50,7 +50,12 @@ async function runOnce(task: string, continueSession: boolean) {
     process.exit(1);
   }
   const root = process.cwd();
-  let session = continueSession ? loadLatestSession(root) : undefined;
+  // --session 显式指定会话；--continue 是「最近一次」，多任务并行时会串线，程序调用建议传显式 id
+  let session = sessionId ? loadSession(root, sessionId) : continueSession ? loadLatestSession(root) : undefined;
+  if (sessionId && !session) {
+    console.error(`会话 ${sessionId} 不存在`);
+    process.exit(1);
+  }
   if (!session) session = createSession();
   if (session.messages.length === 0) {
     session.messages.push({ role: "system", content: buildSystemPrompt(root) });
@@ -86,6 +91,7 @@ async function runOnce(task: string, continueSession: boolean) {
     return new Promise((r) => (answerWaiter = r));
   };
 
+  let lastError: string | null = null;
   const round = await runAgent({
     ...config,
     root,
@@ -114,7 +120,7 @@ async function runOnce(task: string, continueSession: boolean) {
           break;
         case "error":
           console.error(`[error] ${e.text}`);
-          process.exitCode = 1; // 调用方看退出码即可知道任务是否翻车
+          lastError = e.text; // 进结构化摘要的 error 字段，退出码另按「有无成果」判
           break;
       }
     },
@@ -142,14 +148,38 @@ async function runOnce(task: string, continueSession: boolean) {
     session.pending = undefined;
   }
   saveSession(root, session);
-  if (round.outcome.startsWith("中断")) process.exitCode = 1;
+
+  // 结构化收尾：成果与事故分离呈现（干完活之后的收尾错误不该把整趟活标成失败）。
+  // 退出码语义：0 = 有成果（正常结束，或翻车前已有产出/已 commit 的部分成功），1 = 颗粒无收
+  const filesChanged = [
+    ...new Set(
+      round.actions
+        .filter((a) => (a.kind === "edit" || a.kind === "write") && !a.failed)
+        .map((a) => a.target)
+    ),
+  ];
+  const interrupted = round.outcome.startsWith("中断") || round.outcome.startsWith("被用户打断");
+  const result = {
+    outcome: round.outcome,
+    filesChanged,
+    committed: round.committed,
+    error: interrupted ? lastError || round.outcome : null,
+    sessionId: session.id,
+  };
+  process.stdout.write(`\n@@RESULT@@${JSON.stringify(result)}\n`);
+  process.exitCode = interrupted && filesChanged.length === 0 && !round.committed ? 1 : 0;
 }
 
 async function main() {
   const argvAll = process.argv.slice(2);
   const pIdx = argvAll.indexOf("-p");
   if (pIdx >= 0 && argvAll[pIdx + 1]) {
-    await runOnce(argvAll[pIdx + 1], argvAll.includes("--continue"));
+    const sIdx = argvAll.indexOf("--session");
+    await runOnce(
+      argvAll[pIdx + 1],
+      argvAll.includes("--continue"),
+      sIdx >= 0 ? argvAll[sIdx + 1] : undefined
+    );
     return;
   }
 
