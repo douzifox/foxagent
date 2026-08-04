@@ -12,6 +12,9 @@ const MAX_OUTPUT = 8000;
 export interface ToolIO {
   confirmCommand: (cmd: string) => Promise<boolean>;
   showEdit: (file: string, diffText: string) => void;
+  // ask 工具的通道：交互模式问真人，-p 模式走哨兵协议问调用方。
+  // 返回 null = 没人接电话（stdin 已关 / 用户取消），工具层会如实告诉模型
+  askUser?: (question: string) => Promise<string | null>;
 }
 
 // 只有匹配到这些的命令才需要用户点头，其余自动执行
@@ -174,6 +177,25 @@ export const TOOLS = [
   {
     type: "function",
     function: {
+      name: "ask",
+      description:
+        "向指挥者（用户或调用方）提问并等待回答。只在拿不准的决策、任务描述有歧义或矛盾时使用；" +
+        "能自己查清楚的不要问——读代码、跑命令验证优先。问题要带上下文和你倾向的选项，别把提问变成甩锅。",
+      parameters: {
+        type: "object",
+        properties: {
+          question: {
+            type: "string",
+            description: "要问的问题，附上必要上下文和你的倾向，如「棋盘索引是 g[y][x] 还是 g[x][y]？我看 render 里像前者」",
+          },
+        },
+        required: ["question"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "run_command",
       description:
         "在工作区根目录执行一条 shell 命令（跑测试、编译、git status 等）。普通命令直接执行；删除、git push 等危险命令会先请求用户确认。输出包含 stdout 和 stderr。",
@@ -304,9 +326,21 @@ async function searchTool(root: string, args: any): Promise<string> {
 async function runCommandTool(root: string, args: any, io: ToolIO): Promise<string> {
   if (isDangerous(args.command)) {
     const ok = await io.confirmCommand(args.command);
-    if (!ok) return "用户拒绝了这条命令。请换一种方式，或询问用户的意见。";
+    if (!ok) return "用户拒绝了这条命令。请换一种方式，或用 ask 工具询问指挥者的意见。";
   }
   return truncate(await runExec(args.command, root, 120000));
+}
+
+const OFFLINE_ANSWER =
+  "（指挥者不在线，无法回答。请按最合理的理解继续，并在最终汇报里说明你做了什么假设。）";
+
+async function askTool(args: any, io: ToolIO): Promise<string> {
+  const question = String(args.question || "").trim();
+  if (!question) throw new Error("question 不能为空");
+  if (!io.askUser) return OFFLINE_ANSWER;
+  const answer = await io.askUser(question);
+  if (answer === null) return OFFLINE_ANSWER;
+  return `指挥者回答：${answer}`;
 }
 
 export async function executeTool(
@@ -327,6 +361,8 @@ export async function executeTool(
         return await listDirTool(root, args);
       case "search":
         return await searchTool(root, args);
+      case "ask":
+        return await askTool(args, io);
       case "run_command":
         return await runCommandTool(root, args, io);
       default:

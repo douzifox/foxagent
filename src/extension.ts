@@ -171,6 +171,15 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
           );
           return pick === "执行";
         },
+        // ask 工具：模型拿不准时弹输入框问真人。Esc 取消/空回答 → 当作不在线
+        askUser: async (q) => {
+          const a = await vscode.window.showInputBox({
+            prompt: q,
+            ignoreFocusOut: true,
+            placeHolder: "回答 FoxAgent 的提问（Esc 跳过）",
+          });
+          return a === undefined || a.trim() === "" ? null : a.trim();
+        },
         // 修改自动应用，diff 展示在聊天面板里
         showEdit: (file, diffText) => {
           this.post({ type: "editApplied", file, diff: diffText });

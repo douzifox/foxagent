@@ -13,7 +13,10 @@
    代价：num_ctx 客户端设不了，要在 Ollama 服务端配 OLLAMA_CONTEXT_LENGTH。
 
 4. **配置只认环境变量**（FOXAGENT_HOST / API_KEY / MODEL + 可选项）
-   密钥不落任何文件。VS Code 设置项全部删除，两端同一套配置。
+   VS Code 设置项全部删除，两端同一套配置。
+   2026-08-04 修订：红线从「密钥不落任何文件」改为「密钥不进项目目录」——
+   主目录下的配置可以落盘（~/.claude.json 的 MCP env 字段、~/.config/foxagent/env 兜底），
+   「CC 的密钥也落盘，我不过是没用 API 模式而已」；进业务项目目录（会被 git/其他工具扫到）才是事故。
 
 5. **自动批准 + 危险分级**
    「rm 这种才要确认，不然烦死了。」文件修改自动应用（diff 留痕，git 兜底）；

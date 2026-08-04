@@ -256,6 +256,7 @@ async function wrapUp(
         const output = await executeTool(name, args, opts.root, {
           confirmCommand: opts.confirmCommand,
           showEdit: opts.showEdit,
+          askUser: opts.askUser,
         });
         opts.onEvent({ type: "tool_result", name, output });
         wrapMessages.push({
@@ -361,6 +362,7 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
         const output = await executeTool(name, args, opts.root, {
           confirmCommand: opts.confirmCommand,
           showEdit: opts.showEdit,
+          askUser: opts.askUser,
         });
         onEvent({ type: "tool_result", name, output });
         const action = toAction(name, args, output);

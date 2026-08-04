@@ -38,8 +38,9 @@ function colorDiff(diffText: string): string {
     .join("\n");
 }
 
-// -p 单任务模式：给程序（比如 Claude Code）调用的非交互入口。
-// 无确认交互——危险命令一律拒绝并如实汇报，让调用方自己处理；干完即退。
+// -p 单任务模式：给程序（比如 Claude Code 经由 mcp.ts）调用的非交互入口。
+// 双向沟通走哨兵协议：需要确认/提问时向 stdout 打一行 @@ASK@@{...}，
+// 然后等 stdin 的一行回复。没人接（stdin 已关/EOF）→ 当作拒绝/不在线，如实汇报。
 async function runOnce(task: string, continueSession: boolean) {
   let config;
   try {
@@ -55,6 +56,35 @@ async function runOnce(task: string, continueSession: boolean) {
     session.messages.push({ role: "system", content: buildSystemPrompt(root) });
   }
   session.messages.push({ role: "user", content: task });
+
+  // 哨兵问答通道：一行问题出去，一行回答进来。
+  // 回答可能在提问之前就被写进 stdin（调用方抢跑）——先排队，问的时候按序取
+  const rl = readline.createInterface({ input: stdin });
+  const pendingAnswers: string[] = [];
+  let answerWaiter: ((s: string | null) => void) | null = null;
+  let stdinClosed = false;
+  rl.on("line", (l) => {
+    if (answerWaiter) {
+      const w = answerWaiter;
+      answerWaiter = null;
+      w(l);
+    } else pendingAnswers.push(l);
+  });
+  rl.on("close", () => {
+    stdinClosed = true;
+    if (answerWaiter) {
+      const w = answerWaiter;
+      answerWaiter = null;
+      w(null);
+    }
+  });
+  const askRemote = (payload: { type: "confirm" | "ask"; question: string }): Promise<string | null> => {
+    // 换行前置：流式输出可能停在半行，保证哨兵一定落在行首
+    process.stdout.write(`\n@@ASK@@${JSON.stringify(payload)}\n`);
+    if (pendingAnswers.length > 0) return Promise.resolve(pendingAnswers.shift()!);
+    if (stdinClosed) return Promise.resolve(null);
+    return new Promise((r) => (answerWaiter = r));
+  };
 
   const round = await runAgent({
     ...config,
@@ -89,13 +119,22 @@ async function runOnce(task: string, continueSession: boolean) {
       }
     },
     confirmCommand: async (cmd) => {
-      console.log(`[blocked] 非交互模式，危险命令已拒绝：${cmd}`);
-      return false;
+      const a = (await askRemote({ type: "confirm", question: `要执行这条危险命令吗：${cmd}` }))
+        ?.trim()
+        .toLowerCase();
+      const ok = a === "y" || a === "yes";
+      if (!ok) console.log(`[blocked] 危险命令未获批准：${cmd}`);
+      return ok;
+    },
+    askUser: async (q) => {
+      const a = await askRemote({ type: "ask", question: q });
+      return a === null || a.trim() === "" ? null : a.trim();
     },
     showEdit: (file, diffText) => {
       console.log(`[edit] ${file}\n${diffText}`);
     },
   });
+  rl.close();
 
   session.pending = mergePending(session.pending, task, round);
   if (round.committed) {
@@ -303,6 +342,12 @@ async function main() {
         }
       },
       confirmCommand: (cmd) => ask(`\n${yellow("危险命令，要执行吗：")}${cmd}\n`),
+      // ask 工具：模型拿不准时问真人。Esc 打断/空回答 → 当作不在线
+      askUser: async (q) => {
+        if (currentAbort?.signal.aborted) return null;
+        const a = await question(`\n${yellow("❓ FoxAgent 提问：")}${q}\n${cyan("回答 > ")}`);
+        return a === null || a.trim() === "" ? null : a.trim();
+      },
       showEdit: (file, diffText) => {
         console.log(`\n${yellow(`✏️ ${file}`)}\n${colorDiff(diffText)}\n${dim("✅ 已应用")}`);
       },
