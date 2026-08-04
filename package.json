@@ -1,0 +1,70 @@
+{
+  "name": "foxagent",
+  "displayName": "FoxAgent",
+  "description": "自己的 coding agent —— 连接本地/远程 Ollama，读代码、改代码、跑命令",
+  "version": "0.1.0",
+  "publisher": "douzifox",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "foxagent",
+          "title": "FoxAgent",
+          "icon": "media/fox.svg"
+        }
+      ]
+    },
+    "views": {
+      "foxagent": [
+        {
+          "type": "webview",
+          "id": "foxagent.chat",
+          "name": "聊天"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "foxagent.newSession",
+        "title": "FoxAgent: 新会话",
+        "icon": "$(add)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "foxagent.newSession",
+          "when": "view == foxagent.chat",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "check": "tsc --noEmit",
+    "cli": "bun src/cli.ts",
+    "cli:compile": "bun build --compile src/cli.ts --outfile foxagent",
+    "cli:compile:win": "bun build --compile --target=bun-windows-x64 src/cli.ts --outfile foxagent.exe"
+  },
+  "devDependencies": {
+    "@types/diff": "^8.0.0",
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "diff": "^9.0.0"
+  }
+}
