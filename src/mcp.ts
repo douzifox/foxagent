@@ -35,9 +35,7 @@ const TOOLS = [
 ];
 
 function send(msg: any) {
-  const json = JSON.stringify(msg);
-  const header = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n`;
-  process.stdout.write(header + json);
+  process.stdout.write(JSON.stringify(msg) + "\n");
 }
 
 function reply(id: any, result: any) {
@@ -115,34 +113,15 @@ async function handleMessage(msg: any) {
   }
 }
 
-// MCP 用 Content-Length 分帧的 JSON-RPC（和 LSP 一样的传输层）
+// MCP stdio 传输层：每行一条 JSON（不是 LSP 的 Content-Length 分帧）
 const rl = readline.createInterface({ input: process.stdin });
-let buf = "";
-let contentLength = -1;
 
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString();
-  while (true) {
-    if (contentLength < 0) {
-      const headerEnd = buf.indexOf("\r\n\r\n");
-      if (headerEnd < 0) break;
-      const header = buf.slice(0, headerEnd);
-      const m = header.match(/Content-Length:\s*(\d+)/i);
-      if (!m) {
-        buf = buf.slice(headerEnd + 4);
-        continue;
-      }
-      contentLength = Number(m[1]);
-      buf = buf.slice(headerEnd + 4);
-    }
-    if (buf.length < contentLength) break;
-    const body = buf.slice(0, contentLength);
-    buf = buf.slice(contentLength);
-    contentLength = -1;
-    try {
-      handleMessage(JSON.parse(body));
-    } catch {}
-  }
+rl.on("line", (line) => {
+  const body = line.trim();
+  if (!body) return;
+  try {
+    handleMessage(JSON.parse(body));
+  } catch {}
 });
 
 rl.on("close", () => process.exit(0));
