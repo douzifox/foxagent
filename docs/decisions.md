@@ -129,6 +129,14 @@
     防死循环靠 maxIters=500 兜底。tokensSpent/cacheHitRate 观测保留。
     「按缓存加权计量」不做——无默认预算后失去意义。修订决策 16 的「默认 = 窗口 × 5」。
 
+22. **fox_status/fox_wait 的 newOutput 默认截断至尾部 1.5k**（2026-08-13，经 lvbc 转达拍板）
+    动机：小狐狸的 CC Max 被限流，排查发现 newOutput 日志回流是调用方上下文的单项大头——
+    每次几 KB 到几十 KB 增量灌进 CC 上下文，随满窗口每轮重复计入 input。
+    默认只回尾部约 1.5k 字符并标注「[前 N 字符已省略，完整轨迹见 logPath]」；
+    verbose: true 恢复全量（8k 分页 + hasMore），tailChars 自定义尾长。
+    终态 result 与 question 保持全量——价值密度高，是验收要用的；只瘦流水账。
+    instructions 补验收指引：优先读产出文件/grep logPath，别依赖 newOutput 全量。
+
 ## 待办（pi 借鉴清单，按价值排序）
 
 源码在需要时 clone badlogic/pi-mono，重点 packages/agent/src/harness/。

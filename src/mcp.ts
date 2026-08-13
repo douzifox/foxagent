@@ -19,7 +19,8 @@ import { loadConfig } from "./config";
 
 const CLI_PATH = path.join(__dirname, "cli.ts");
 
-const STATUS_CHUNK = 8000; // fox_status 单次最多带走的输出字符数
+const STATUS_CHUNK = 8000; // verbose 模式单次最多带走的输出字符数（分页 + hasMore）
+const DEFAULT_TAIL = 1500; // 默认模式 newOutput 只回尾部这么多字符（决策 22：流水账灌上下文是调用方限流大头）
 const BUFFER_CAP = 200_000; // 未取走输出的内存上限，超出丢中间留两头（完整轨迹在日志文件）
 
 interface FoxTask {
@@ -84,14 +85,17 @@ const TOOLS = [
   {
     name: "fox_status",
     description:
-      "查询 FoxAgent 任务状态，返回自上次查询以来的增量输出（长任务建议每 2~4 分钟查一次）。" +
-      "state=waiting_for_input 时附带 question，需要用 fox_reply 回答任务才会继续；" +
-      "state=done/failed 时附带结构化结果摘要（result）。任何状态都带 logPath（完整轨迹日志），" +
+      "查询 FoxAgent 任务状态（长任务建议每 2~4 分钟查一次）。newOutput 默认只带增量输出的尾部约 1.5k" +
+      "字符（省 token；被省略部分见 logPath），要全量传 verbose。" +
+      "state=waiting_for_input 时附带 question（全量），需要用 fox_reply 回答任务才会继续；" +
+      "state=done/failed 时附带结构化结果摘要 result（全量）。任何状态都带 logPath（完整轨迹日志），" +
       "怀疑任务假死时直接 tail 该文件：以 @@RESULT@@ 行结尾说明进程其实已经收尾。",
     inputSchema: {
       type: "object",
       properties: {
         taskId: { type: "string", description: "fox_submit 返回的任务 id" },
+        verbose: { type: "boolean", description: "true = newOutput 取全量（按 8k 分页，hasMore 提示继续取）。默认 false" },
+        tailChars: { type: "number", description: "自定义 newOutput 尾部字符数（默认 1500，范围 200~100000）" },
       },
       required: ["taskId"],
     },
@@ -110,6 +114,8 @@ const TOOLS = [
           type: "number",
           description: "本次挂起最长等多少秒（默认 300，范围 5~570；需短于客户端的 MCP 工具超时）",
         },
+        verbose: { type: "boolean", description: "true = newOutput 取全量。默认 false（只带尾部约 1.5k 字符，result/question 不受影响）" },
+        tailChars: { type: "number", description: "自定义 newOutput 尾部字符数（默认 1500，范围 200~100000）" },
       },
       required: ["taskId"],
     },
@@ -294,18 +300,37 @@ function submitTask(
   return { ok: true, taskId, logPath, tokenBudget };
 }
 
-function statusTask(taskId: string): any {
+interface OutputOpts {
+  verbose?: boolean; // 全量模式：按 STATUS_CHUNK 分页 + hasMore（旧行为）
+  tailChars?: number; // 尾部字符数（默认 DEFAULT_TAIL）
+}
+
+function statusTask(taskId: string, opts?: OutputOpts): any {
   const t = tasks.get(taskId);
   if (!t) {
     return {
       error: `任务 ${taskId} 不存在（MCP 服务器可能重启过，任务表不持久化）`,
     };
   }
-  const newOutput = t.pending.slice(0, STATUS_CHUNK);
-  t.pending = t.pending.slice(newOutput.length);
+  // newOutput 默认只回尾部（决策 22）：几 KB 流水账灌进调用方上下文、随满窗口每轮重复计费。
+  // 终态 result 与 question 不受影响——价值密度高，保持全量
+  let newOutput: string;
+  if (opts?.verbose) {
+    newOutput = t.pending.slice(0, STATUS_CHUNK);
+    t.pending = t.pending.slice(newOutput.length);
+  } else {
+    const rawTail = Number(opts?.tailChars);
+    const tail = Number.isFinite(rawTail) ? Math.min(Math.max(rawTail, 200), 100_000) : DEFAULT_TAIL;
+    const full = t.pending;
+    t.pending = ""; // 尾部模式一次性清空缓冲，被省略的部分只活在日志文件里
+    newOutput =
+      full.length > tail
+        ? `[前 ${full.length - tail} 字符已省略，完整轨迹见 logPath]\n` + full.slice(-tail)
+        : full;
+  }
   // logPath 任何状态都给：运行中调用方可以直接 tail 判断是否假死（增量长时间为空 ≠ 挂了）
   const out: any = { state: t.state, newOutput, logPath: t.logPath };
-  if (t.pending.length > 0) out.hasMore = true; // 还有没取完的输出，马上再调一次
+  if (t.pending.length > 0) out.hasMore = true; // verbose 模式还有没取完的输出，马上再调一次
   if (t.state === "waiting_for_input" && t.question) out.question = t.question;
   if (t.state === "done" || t.state === "failed") {
     out.exitCode = t.exitCode;
@@ -323,7 +348,7 @@ function statusTask(taskId: string): any {
 // 挂起直到任务跳出 running（完成/失败/提问），或等满 timeoutSec。
 // 返回格式与 fox_status 完全一致（含增量输出与终态 result）；超时时 state 仍是 running，
 // 调用方再调一次续等即可（续租模式：server 端超时要短于 MCP 客户端的工具超时）
-async function waitTask(taskId: string, timeoutSec: number): Promise<any> {
+async function waitTask(taskId: string, timeoutSec: number, opts?: OutputOpts): Promise<any> {
   const t = tasks.get(taskId);
   if (!t) {
     return { error: `任务 ${taskId} 不存在（MCP 服务器可能重启过，任务表不持久化）` };
@@ -342,7 +367,7 @@ async function waitTask(taskId: string, timeoutSec: number): Promise<any> {
       t.waiters.push(done);
     });
   }
-  const s = statusTask(taskId);
+  const s = statusTask(taskId, opts);
   if (s.state === "running") {
     s.note = `等待 ${timeoutSec} 秒后任务仍在运行（正常，长任务需要时间）。再调一次 fox_wait 续等即可。`;
   }
@@ -378,6 +403,8 @@ async function handleMessage(msg: any) {
           "【等待】两种模式按场景选：赶工用 fox_wait 挂起（超时返回 running 是续租信号，再调即可）；" +
           "需要边等边处理别的事时改零占用模式——后台定时 grep 日志文件（fox_submit 返回的 logPath），" +
           "出现 @@RESULT@@ 行即任务收尾，不占用你的回合。\n" +
+          "【验收】优先读它的产出文件和 result 摘要、需要细节时 grep logPath——" +
+          "别依赖 newOutput 全量（默认只回尾部，为省你的上下文）。\n" +
           "【续会话】跨 session 接续工作：先 fox_sessions 按 cwd 列历史会话（含最近任务与最后回复摘要），" +
           "再 fox_submit 传 session=<id> 续上，旧分析上下文都在。续跑中断任务时在工单里要求" +
           "「基于已有分析收敛产出，不要重新大面积浏览」。多任务并行必须用显式 session id，别用 continueSession（会串线）。",
@@ -409,7 +436,10 @@ async function handleMessage(msg: any) {
           break;
         }
         case "fox_status": {
-          const s = statusTask(String(args?.taskId || ""));
+          const s = statusTask(String(args?.taskId || ""), {
+            verbose: args?.verbose === true,
+            tailChars: args?.tailChars,
+          });
           replyText(id, s, !!s.error);
           break;
         }
@@ -417,7 +447,10 @@ async function handleMessage(msg: any) {
           // clamp 而非报错：等待时长是软约束，上限留在 MCP 客户端默认工具超时（600s）之内
           const raw = Number(args?.timeoutSec);
           const timeoutSec = Number.isFinite(raw) ? Math.min(Math.max(raw, 5), 570) : 300;
-          const s = await waitTask(String(args?.taskId || ""), timeoutSec);
+          const s = await waitTask(String(args?.taskId || ""), timeoutSec, {
+            verbose: args?.verbose === true,
+            tailChars: args?.tailChars,
+          });
           replyText(id, s, !!s.error);
           break;
         }

@@ -67,10 +67,11 @@ fox_sessions 续会话）——跨项目、跨 session 传播用法的唯一可�
 跳出 running 才返回，返回格式与 fox_status 一致；任务表里挂 waiters 回调，
 状态跳变点唤醒；等满 timeoutSec（默认 300，clamp 5~570，须短于客户端
 MCP 工具超时）返回 running + 续租 note，调用方再调一次续等）或
-`fox_status`（增量输出，单次 ≤8k 字符，hasMore 提示继续取；哨兵行转成
-waiting_for_input 状态；任何状态都带 logPath 供调用方 tail 判断假死；
-result.outcome 以「中断」开头时附续跑指引 note）→ `fox_reply`（写回子进程
-stdin）；`fox_sessions`（列项目历史会话——session.ts summarizeSessions，
+`fox_status`（增量输出默认只回尾部 1.5k 字符并标注省略量——流水账灌调用方
+上下文是限流大头，决策 22；verbose 全量 8k 分页 + hasMore，tailChars 自定义；
+result/question 恒全量；哨兵行转成 waiting_for_input 状态；任何状态都带
+logPath 供调用方 tail 判断假死；result.outcome 以「中断」开头时附续跑指引
+note）→ `fox_reply`（写回子进程 stdin）；`fox_sessions`（列项目历史会话——session.ts summarizeSessions，
 含最近任务/最后回复摘要/轮数，供新调用方找回会话续聊）。
 任务表仅内存，服务器进程没了任务即不存在。
 完整轨迹落 `runs/<taskId>.log`，MCP 端只回传增量与摘要。
