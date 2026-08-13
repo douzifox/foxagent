@@ -5,7 +5,7 @@ import type { PendingJournal } from "./journal";
 import { sessionsDir } from "./paths";
 
 // 会话按项目目录隔离（见 paths.ts），在哪个项目里干活就只看到哪个项目的会话。
-// CLI 和 VS Code 插件读写同一份 —— 终端开的工，可以到编辑器里接着干
+// CLI 交互模式和 -p/MCP 读写同一份——终端开的工，派任务续会话接着干
 export interface Session {
   id: string;
   title: string;
@@ -77,6 +77,41 @@ export function listSessions(root: string): { id: string; title: string; updated
     title: s.title,
     updatedAt: s.updatedAt,
   }));
+}
+
+// MCP 端会话清单：给新调用方找回之前的会话续聊用。
+// 比 title 更有用的是「最后干到哪了」——最近任务 + 最后一次文字回复（通常是最终汇报或收敛总结）
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  rounds: number; // 模型响应轮数（assistant 消息数）
+  lastTask?: string;
+  lastOutcome?: string;
+}
+
+export function summarizeSessions(root: string): SessionSummary[] {
+  const clip = (t: string | undefined) => {
+    const s = (t || "").replace(/\s+/g, " ").trim();
+    return s.length > 200 ? s.slice(0, 200) + "…" : s || undefined;
+  };
+  return loadAllSessions(root).map((s) => {
+    // 「【系统」开头的是代码注入的收敛提醒/收尾指令，不是调用方派的任务
+    const lastUser = [...s.messages]
+      .reverse()
+      .find((m) => m.role === "user" && !m.content.startsWith("【系统"));
+    const lastAssistant = [...s.messages].reverse().find((m) => m.role === "assistant" && m.content);
+    return {
+      id: s.id,
+      title: s.title,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+      rounds: s.messages.filter((m) => m.role === "assistant").length,
+      lastTask: clip(lastUser?.content),
+      lastOutcome: clip(lastAssistant?.content),
+    };
+  });
 }
 
 export function loadSession(root: string, id: string): Session | undefined {

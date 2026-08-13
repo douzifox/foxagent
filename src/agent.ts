@@ -1,5 +1,5 @@
 import { TOOLS, executeTool, ToolIO } from "./tools";
-import { compactIfNeeded } from "./context";
+import { compactIfNeeded, estimateTokens } from "./context";
 import { Action } from "./journal";
 
 // 只走 OpenAI 兼容格式（DeepSeek、各类网关的 /v1 端点）。
@@ -11,6 +11,9 @@ export interface ChatMessage {
   tool_calls?: any[];
   tool_name?: string;
   tool_call_id?: string;
+  // API usage 带回的计量（token 预算 + 缓存命中率观测用）。读取后立即删除，不落盘进会话
+  promptTokens?: number;
+  cacheHitTokens?: number; // DeepSeek 的 prompt_cache_hit_tokens
 }
 
 export type AgentEvent =
@@ -27,10 +30,10 @@ export interface AgentOptions extends ToolIO {
   host: string;
   apiKey: string;
   model: string;
-  fallbackModel?: string; // 上游重试耗尽后的备用模型（FOXAGENT_FALLBACK_MODEL）
   numCtx: number; // 仅用于上下文压缩阈值
   temperature: number;
-  maxIters: number;
+  maxIters: number; // 防死循环兜底（主预算是 maxTokens，见决策 16）
+  maxTokens: number; // 本次任务的累计 prompt token 预算；80% 提醒收敛，耗尽走总结轮硬断
   root: string;
   messages: ChatMessage[];
   onEvent: (e: AgentEvent) => void;
@@ -101,7 +104,8 @@ export async function chatOnce(
         messages: messages.map(toOpenAI),
         temperature: cfg.temperature,
         ...(withTools ? { tools: TOOLS } : {}),
-        ...(onDelta ? { stream: true } : {}),
+        // include_usage：流式也在最后一个 chunk 返回 usage（预算计量用真值 + 缓存命中观测）
+        ...(onDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
       }),
     });
   } catch (e: any) {
@@ -129,6 +133,8 @@ export async function chatOnce(
       content: m.content || "",
       // DeepSeek 推理模型等的思考在 reasoning_content 字段
       thinking: m.reasoning_content || undefined,
+      promptTokens: data.usage?.prompt_tokens || undefined,
+      cacheHitTokens: data.usage?.prompt_cache_hit_tokens || undefined,
     };
     if (m.tool_calls?.length) {
       out.tool_calls = m.tool_calls.map((c: any, i: number) => ({
@@ -147,6 +153,8 @@ export async function chatOnce(
   let content = "";
   let thinking = "";
   let finishReason: string | undefined;
+  let promptTokens: number | undefined; // usage 在最后一个 SSE chunk（include_usage 已开）
+  let cacheHitTokens: number | undefined;
   const slots: { id?: string; name: string; args: string }[] = [];
   const processLine = (line: string) => {
     const t = line.trim();
@@ -162,6 +170,8 @@ export async function chatOnce(
     if (json.error) {
       throw new Error(json.error.message || JSON.stringify(json.error));
     }
+    if (json.usage?.prompt_tokens) promptTokens = json.usage.prompt_tokens;
+    if (json.usage?.prompt_cache_hit_tokens) cacheHitTokens = json.usage.prompt_cache_hit_tokens;
     const choice = json.choices?.[0];
     if (!choice) return;
     if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -205,6 +215,8 @@ export async function chatOnce(
     role: "assistant",
     content,
     thinking: thinking || undefined,
+    promptTokens,
+    cacheHitTokens,
   };
   const calls = slots.filter(Boolean);
   if (calls.length) {
@@ -219,7 +231,7 @@ export async function chatOnce(
 
 // ---- 上游重试 ----
 // 503/429/网络抖动是常态，不重试就翻车（MCP 指挥实战里第二次任务因 503 颗粒无收）。
-// 指数退避 3 次；耗尽后若配了 FOXAGENT_FALLBACK_MODEL 就换备用模型再试一轮。
+// 指数退避 3 次。不设备用模型——同一 host 上的备用和主力一起挂，是伪冗余（决策 19）
 const RETRY_DELAYS = [2000, 8000, 30000];
 
 function isRetryable(e: any): boolean {
@@ -247,7 +259,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 interface RetryIO {
   onEvent: (e: AgentEvent) => void;
   signal?: AbortSignal;
-  fallbackModel?: string;
 }
 
 export async function chatWithRetry(
@@ -257,8 +268,6 @@ export async function chatWithRetry(
   withTools: boolean,
   onDelta?: (kind: "text" | "thinking", text: string) => void
 ): Promise<ChatMessage> {
-  const models = [cfg.model];
-  if (io.fallbackModel && io.fallbackModel !== cfg.model) models.push(io.fallbackModel);
   // 流式已经吐过增量的失败不能重试——重放会让调用方看到重复内容
   let emitted = false;
   const wrapDelta = onDelta
@@ -267,29 +276,21 @@ export async function chatWithRetry(
         onDelta(kind, text);
       }
     : undefined;
-  let lastErr: any;
-  for (let mi = 0; mi < models.length; mi++) {
-    for (let attempt = 0; ; attempt++) {
-      emitted = false;
-      try {
-        return await chatOnce({ ...cfg, model: models[mi] }, messages, withTools, wrapDelta, io.signal);
-      } catch (e: any) {
-        lastErr = e;
-        if (e?.name === "AbortError" || emitted || !isRetryable(e)) throw e;
-        if (attempt >= RETRY_DELAYS.length) break; // 本模型重试耗尽，看有没有备用
-        const delay = RETRY_DELAYS[attempt];
-        io.onEvent({
-          type: "status",
-          text: `上游繁忙（${e.status ?? "网络错误"}），${delay / 1000} 秒后重试 ${attempt + 1}/${RETRY_DELAYS.length}…`,
-        });
-        await sleep(delay, io.signal);
-      }
-    }
-    if (mi + 1 < models.length) {
-      io.onEvent({ type: "status", text: `重试耗尽，换备用模型 ${models[mi + 1]} 再试…` });
+  for (let attempt = 0; ; attempt++) {
+    emitted = false;
+    try {
+      return await chatOnce(cfg, messages, withTools, wrapDelta, io.signal);
+    } catch (e: any) {
+      if (e?.name === "AbortError" || emitted || !isRetryable(e)) throw e;
+      if (attempt >= RETRY_DELAYS.length) throw e; // 重试耗尽
+      const delay = RETRY_DELAYS[attempt];
+      io.onEvent({
+        type: "status",
+        text: `上游繁忙（${e.status ?? "网络错误"}），${delay / 1000} 秒后重试 ${attempt + 1}/${RETRY_DELAYS.length}…`,
+      });
+      await sleep(delay, io.signal);
     }
   }
-  throw lastErr;
 }
 
 // 失败判定的唯一来源——journal 标注和 pitfall 记录共用，避免两处结论矛盾
@@ -329,12 +330,7 @@ async function wrapUp(
   for (let i = 0; i < 5; i++) {
     let msg: ChatMessage;
     try {
-      msg = await chatWithRetry(
-        cfg,
-        { onEvent: opts.onEvent, signal: opts.signal, fallbackModel: opts.fallbackModel },
-        wrapMessages,
-        true
-      );
+      msg = await chatWithRetry(cfg, { onEvent: opts.onEvent, signal: opts.signal }, wrapMessages, true);
     } catch {
       return; // 收尾失败不影响主任务
     }
@@ -371,6 +367,8 @@ export interface RoundResult {
   pitfalls: string[];
   outcome: string;
   committed: boolean;
+  tokensSpent: number; // 本轮任务累计 prompt token（预算口径：usage 真值优先，缺失按估算）
+  cacheHitRate?: number; // 接口缓存命中率（0~1，仅在 usage 有数据时给出）——调压缩阈值的实测依据
 }
 
 // 核心循环：问模型 → 它要用工具就执行并回传 → 直到它开口说话
@@ -385,6 +383,18 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
   const actions: Action[] = [];
   const pitfalls: string[] = [];
   let committed = false;
+  // 累计 token 预算（决策 16）：每轮累加发送的 prompt 大小，优先 API usage 真值，缺失退回字符估算。
+  // 只计主循环（成本主体）；压缩/收尾轮的调用次数有限，不计入
+  let spentTokens = 0;
+  let budgetWarned = false;
+  let interruptReason: string | undefined;
+  // usage 真值的累计（缓存命中率只能按真值算，估算轮不进分母）
+  let usagePrompt = 0;
+  let usageHit = 0;
+  const metrics = () => ({
+    tokensSpent: spentTokens,
+    cacheHitRate: usagePrompt > 0 ? Math.round((usageHit / usagePrompt) * 1000) / 1000 : undefined,
+  });
 
   for (let i = 0; i < opts.maxIters; i++) {
     await compactIfNeeded(messages, {
@@ -393,7 +403,7 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
       complete: async (prompt) => {
         const m = await chatWithRetry(
           { ...cfg, temperature: 0.1 },
-          { onEvent, signal: opts.signal, fallbackModel: opts.fallbackModel },
+          { onEvent, signal: opts.signal },
           [{ role: "user", content: prompt }],
           false
         );
@@ -403,15 +413,54 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
 
     if (opts.signal?.aborted) {
       onEvent({ type: "status", text: "已被打断" });
-      return { actions, pitfalls, outcome: "被用户打断", committed };
+      return { actions, pitfalls, outcome: "被用户打断", committed, ...metrics() };
+    }
+
+    // token 预算是主限：耗尽 → 跳去总结轮硬断；过 80% → 注入一次收敛提醒。
+    // 提醒必须按「本轮末的预测水位」判断（累计 + 本轮将发送的 prompt）：
+    // 累计消耗平方级增长，后期单轮增量就超过预算的 20%，只看已累计值会整轮跨过 80% 线、
+    // 提醒永远不触发（lvbc 验收实测）。预测式保证硬断前至少有一轮带着提醒跑
+    if (spentTokens >= opts.maxTokens) {
+      interruptReason = `达到 token 预算上限（已消耗约 ${spentTokens}，预算 ${opts.maxTokens}，FOXAGENT_MAX_TOKENS 可调）`;
+      break;
+    }
+    const projected = spentTokens + estimateTokens(messages);
+    if (!budgetWarned && projected >= opts.maxTokens * 0.8) {
+      budgetWarned = true;
+      messages.push({
+        role: "user",
+        content:
+          "【系统提醒】本任务的 token 预算即将超过 80%，耗尽后任务会被强制中断。" +
+          "请立即收敛：把剩余操作尽量合并到同一轮批量执行，停止大范围浏览，" +
+          "完成最要紧的产出并给出最终结论；确实做不完就直接汇报当前进展、关键发现和剩余工作。",
+      });
+      onEvent({
+        type: "status",
+        text: `token 预算将过 80%（已用约 ${spentTokens}，本轮末预计 ${projected}/${opts.maxTokens}），已提醒模型收敛`,
+      });
+    }
+
+    // 轮数快耗尽时明确提醒模型收敛——确定性机制，不指望它自己数轮数。
+    // 细读型任务最容易在这里烧完次数被硬断（MCP 指挥实战踩过）。
+    // 上限本来就小的场景不注入，免得一开场就催收。放在压缩之后，避免刚注入就被总结掉
+    if (opts.maxIters - i === 5 && opts.maxIters > 10) {
+      messages.push({
+        role: "user",
+        content:
+          "【系统提醒】剩余响应轮数只有 5 轮，之后任务会被强制中断。一轮内批量发起多个工具调用只算一轮——" +
+          "请立即收敛：把剩余操作尽量合并到同一轮批量执行，停止大范围浏览，" +
+          "完成最要紧的产出并给出最终结论；确实做不完就直接汇报当前进展、关键发现和剩余工作。",
+      });
+      onEvent({ type: "status", text: "剩余循环次数不多，已提醒模型收敛" });
     }
 
     let msg: ChatMessage;
     let sawDelta = false;
+    const estBefore = estimateTokens(messages); // usage 缺失时的计量兜底（发送前的上下文大小）
     try {
       msg = await chatWithRetry(
         cfg,
-        { onEvent, signal: opts.signal, fallbackModel: opts.fallbackModel },
+        { onEvent, signal: opts.signal },
         messages,
         true,
         (kind, text) => {
@@ -423,12 +472,19 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
       if (sawDelta) onEvent({ type: "delta_end" });
       if (opts.signal?.aborted || e.name === "AbortError") {
         onEvent({ type: "status", text: "已被打断" });
-        return { actions, pitfalls, outcome: "被用户打断", committed };
+        return { actions, pitfalls, outcome: "被用户打断", committed, ...metrics() };
       }
       onEvent({ type: "error", text: `模型调用失败（${opts.host}）：${e.message || e}` });
-      return { actions, pitfalls, outcome: `中断：模型调用失败（${e.message || e}）`, committed };
+      return { actions, pitfalls, outcome: `中断：模型调用失败（${e.message || e}）`, committed, ...metrics() };
     }
     if (sawDelta) onEvent({ type: "delta_end" });
+    spentTokens += msg.promptTokens ?? estBefore;
+    if (msg.promptTokens) {
+      usagePrompt += msg.promptTokens;
+      usageHit += msg.cacheHitTokens ?? 0;
+    }
+    delete msg.promptTokens; // 临时字段，不落盘进会话
+    delete msg.cacheHitTokens;
     messages.push(msg);
 
     // 流式时增量已经实时显示过，不再重发完整段落
@@ -493,12 +549,37 @@ export async function runAgent(opts: AgentOptions): Promise<RoundResult> {
     if (pitfalls.length > 0) {
       await wrapUp(cfg, opts, [...messages], pitfalls);
     }
-    return { actions, pitfalls, outcome: msg.content || "（完成，无文字回复）", committed };
+    return { actions, pitfalls, outcome: msg.content || "（完成，无文字回复）", committed, ...metrics() };
   }
 
-  onEvent({
-    type: "error",
-    text: `已达到单轮最大循环次数（${opts.maxIters}），先停下来。可以用 FOXAGENT_MAX_ITERS 调大。`,
+  // 预算/轮数耗尽：硬断前让模型（不带工具）把进展说清楚——否则调用方只拿到一句「达到上限」，
+  // 续会话都不知道从哪接。总结进正式会话，续跑时上下文里能看到自己中断过、说过什么
+  if (!interruptReason) {
+    interruptReason = `达到最大循环次数上限（${opts.maxIters}，FOXAGENT_MAX_ITERS 可调）`;
+  }
+  onEvent({ type: "error", text: `已${interruptReason}，先停下来。` });
+  messages.push({
+    role: "user",
+    content:
+      "【系统收尾】循环次数已耗尽，任务被强制中断，现在无法再使用工具。" +
+      "请用纯文本简短总结：①已完成了什么 ②关键发现 ③还没做完什么、建议怎么继续。",
   });
-  return { actions, pitfalls, outcome: `中断：达到最大循环次数 ${opts.maxIters}`, committed };
+  let summary = "";
+  try {
+    const m = await chatWithRetry(cfg, { onEvent, signal: opts.signal }, messages, false);
+    summary = (m.content || "").trim();
+  } catch {}
+  if (summary) {
+    messages.push({ role: "assistant", content: summary });
+    onEvent({ type: "text", text: summary });
+  } else {
+    messages.pop(); // 总结没拿到，别把悬空的收尾指令留在会话里
+  }
+  return {
+    actions,
+    pitfalls,
+    outcome: `中断：${interruptReason}` + (summary ? `。收敛总结：${summary}` : ""),
+    committed,
+    ...metrics(),
+  };
 }

@@ -2,7 +2,8 @@
 // 密钥红线是不进项目目录；主目录配置可落盘（决策 4 修订）。
 // 必须：FOXAGENT_HOST、FOXAGENT_API_KEY、FOXAGENT_MODEL
 // 可选：FOXAGENT_NUM_CTX（压缩阈值，默认按模型窗口推断）、FOXAGENT_TEMPERATURE（默认 0.3）、
-//       FOXAGENT_MAX_ITERS（默认 25）、FOXAGENT_FALLBACK_MODEL（上游重试耗尽后的备用模型）
+//       FOXAGENT_MAX_TOKENS（任务累计 token 预算，默认 = 窗口 × 5，一般不用设——
+//       它同时是 MCP fox_submit maxTokens 参数的透传通道）、FOXAGENT_MAX_ITERS（防死循环兜底，默认 500）
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -13,10 +14,10 @@ export interface FoxConfig {
   host: string;
   apiKey: string;
   model: string; // 已剥离 [1m] 标注的干净模型名，可直接发给 API
-  fallbackModel?: string; // FOXAGENT_FALLBACK_MODEL：上游重试耗尽后的备用模型
-  numCtx: number;
+  numCtx: number; // 压缩触发窗口（[1m] 时跟随抬到 1M，否则 200k / NUM_CTX 覆盖）
   temperature: number;
-  maxIters: number;
+  maxIters: number; // 防死循环兜底（主预算是 maxTokens）
+  maxTokens: number; // 任务累计 prompt token 预算（决策 16）
 }
 
 const DEFAULT_WINDOW = 200_000;
@@ -81,16 +82,19 @@ export function loadConfig(): FoxConfig {
   // NUM_CTX 只覆盖默认值（200k）：模型带 [1m] 推断出 1M 时，以推断值为准不受覆盖；
   // 不带标注时取 NUM_CTX（没设就 200k）
   const { model: cleanModel, window: modelWindow } = parseModel(model!);
+  // [1m] 是整套 1M 模式的开关（决策 14/17）：压缩窗口跟随抬高。
+  // 想要早压缩就用不带 [1m] 的模型名，不另设解耦配置
   const defaultCtx = num("FOXAGENT_NUM_CTX", DEFAULT_WINDOW, 2048, 10_000_000);
-  // 备用模型同样剥 [1m] 标注；它的窗口不参与压缩阈值（阈值按主模型算，偏保守无害）
-  const fallbackRaw = get("FOXAGENT_FALLBACK_MODEL");
+  const numCtx = modelWindow > DEFAULT_WINDOW ? modelWindow : defaultCtx;
   return {
     host: host!,
     apiKey: apiKey!,
     model: cleanModel,
-    fallbackModel: fallbackRaw ? parseModel(fallbackRaw).model : undefined,
-    numCtx: modelWindow > DEFAULT_WINDOW ? modelWindow : defaultCtx,
+    numCtx,
     temperature: num("FOXAGENT_TEMPERATURE", 0.3, 0, 2),
-    maxIters: num("FOXAGENT_MAX_ITERS", 25, 1, 1000),
+    // 主预算按累计 token 计（决策 16），默认 = 模型真实窗口 × 5——换模型不用改配置，
+    // 也不随压缩窗口缩水。轮数只是防死循环兜底：低 token 死循环按预算烧不完，靠它拦
+    maxTokens: num("FOXAGENT_MAX_TOKENS", modelWindow * 5, 10_000, 1_000_000_000),
+    maxIters: num("FOXAGENT_MAX_ITERS", 500, 1, 10_000),
   };
 }

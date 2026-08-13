@@ -7,7 +7,7 @@ import { FOXAGENT_HOME, projectDataDir, projectMemoryDir } from "./paths";
 
 const MAX_OUTPUT = 8000;
 
-// 工具层与界面解耦：VS Code 端弹面板/按钮，CLI 端打印/问 y/n，工具代码不关心是谁在答。
+// 工具层与界面解耦：交互模式在终端问 y/n，-p 模式走哨兵协议问调用方，工具代码不关心是谁在答。
 // 默认自动放行：文件修改直接应用（diff 通过 showEdit 展示），只有危险命令才走 confirmCommand
 export interface ToolIO {
   confirmCommand: (cmd: string) => Promise<boolean>;
@@ -51,7 +51,11 @@ function ensureWithin(abs: string, roots: string[], original: string): string {
   for (const r of roots) {
     if (abs === r || abs.startsWith(r + path.sep)) return abs;
   }
-  throw new Error(`路径 ${original} 超出了允许范围，已拒绝`);
+  throw new Error(
+    `路径 ${original} 超出了允许范围（只能访问工作区和 ~/.foxagent 数据目录），已拒绝。` +
+      `产出文件（报告、清单等）优先放在工作区内；确实要写到外部路径时，` +
+      `改用 run_command 重定向写出（如 cat 加 heredoc），拿不准就先 ask 指挥者。`
+  );
 }
 
 // 把模型给的路径限制在工作区内（记忆所在的 ~/.foxagent/ 除外），防止越界读写。

@@ -26,6 +26,12 @@ const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 
+// 窗口/预算的可读格式：1_000_000 → 1M，200_000 → 200k
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}M`;
+  return `${Math.round(n / 1000)}k`;
+}
+
 function colorDiff(diffText: string): string {
   return diffText
     .split("\n")
@@ -50,6 +56,10 @@ async function runOnce(task: string, continueSession: boolean, sessionId?: strin
     process.exit(1);
   }
   const root = process.cwd();
+  // 露出实际生效的窗口与预算，方便调用方核对（[1m] 标注是否生效、默认预算是多少）
+  console.log(
+    `[status] 模型 ${config.model} · 窗口 ${fmtTokens(config.numCtx)} · token 预算 ${fmtTokens(config.maxTokens)}`
+  );
   // --session 显式指定会话；--continue 是「最近一次」，多任务并行时会串线，程序调用建议传显式 id
   let session = sessionId ? loadSession(root, sessionId) : continueSession ? loadLatestSession(root) : undefined;
   if (sessionId && !session) {
@@ -165,6 +175,9 @@ async function runOnce(task: string, continueSession: boolean, sessionId?: strin
     committed: round.committed,
     error: interrupted ? lastError || round.outcome : null,
     sessionId: session.id,
+    tokensSpent: round.tokensSpent,
+    // 接口缓存命中率（usage 有数据才有）——观测压缩阈值调整效果用
+    ...(round.cacheHitRate !== undefined ? { cacheHitRate: round.cacheHitRate } : {}),
   };
   process.stdout.write(`\n@@RESULT@@${JSON.stringify(result)}\n`);
   process.exitCode = interrupted && filesChanged.length === 0 && !round.committed ? 1 : 0;
@@ -217,6 +230,7 @@ async function main() {
 
   console.log(`\n🦊 ${yellow("FoxAgent")} ${dim(`· ${model} · ${host}`)}`);
   console.log(dim(`   工作目录：${root}`));
+  console.log(dim(`   窗口 ${fmtTokens(config.numCtx)} · token 预算 ${fmtTokens(config.maxTokens)}`));
   console.log(
     resumed
       ? dim(`   继续上次会话「${session.title}」（${session.messages.length} 条消息）；开新会话用 /new`)

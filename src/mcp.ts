@@ -14,6 +14,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import { projectDataDir } from "./paths";
+import { summarizeSessions } from "./session";
+import { loadConfig } from "./config";
 
 const CLI_PATH = path.join(__dirname, "cli.ts");
 
@@ -30,6 +32,14 @@ interface FoxTask {
   exitCode?: number;
   logPath: string;
   log: fs.WriteStream;
+  waiters: (() => void)[]; // fox_wait 的挂起者，状态跳出 running 时全部唤醒
+}
+
+// 状态跳变（waiting_for_input / done / failed）时唤醒所有挂起的 fox_wait
+function wake(t: FoxTask) {
+  const ws = t.waiters;
+  t.waiters = [];
+  for (const w of ws) w();
 }
 
 const tasks = new Map<string, FoxTask>();
@@ -41,6 +51,7 @@ const TOOLS = [
     description:
       "派任务给 FoxAgent（轻量 coding agent）并立即返回 taskId，不等待完成。" +
       "它会在指定目录里自主读代码、改文件、跑命令。适合机械性执行任务（批量修改、按模板铺文件、跑构建验证）。" +
+      "任务描述要给足背景：明确的判定标准、「重点但不限于」的文件清单、「不要动 X」的边界，它会执行得更好。" +
       "提交后用 fox_status 轮询进度；它可能中途提问（危险命令确认、歧义澄清），用 fox_reply 回答。",
     inputSchema: {
       type: "object",
@@ -53,6 +64,19 @@ const TOOLS = [
             "显式会话 id（任务结束时 result.sessionId 里返回）。想接着某次会话继续就传它；多任务并行时别用 continueSession，会串线",
         },
         continueSession: { type: "boolean", description: "是否续上最近一次会话（默认 false，开新会话）" },
+        maxTokens: {
+          type: "number",
+          description:
+            "本任务的累计 token 消耗预算（默认 = 上下文窗口 × 5，实际值见提交返回的 tokenBudget）。" +
+            "消耗到 80% 会提醒模型收敛，耗尽则总结进展后中断。这是主要的任务规模旋钮。" +
+            "注意是软上限：提醒后放行的最后一轮可能超支（小预算下比例明显，实测可超 ~30%），设小预算时留余量",
+        },
+        maxIters: {
+          type: "number",
+          description:
+            "响应轮数上限（默认 500），只是防死循环兜底——控制任务规模请用 maxTokens。" +
+            "按模型响应轮计：一轮内批量发起多个工具调用只算一轮",
+        },
       },
       required: ["task", "cwd"],
     },
@@ -60,15 +84,49 @@ const TOOLS = [
   {
     name: "fox_status",
     description:
-      "查询 FoxAgent 任务状态，返回自上次查询以来的增量输出。" +
+      "查询 FoxAgent 任务状态，返回自上次查询以来的增量输出（长任务建议每 2~4 分钟查一次）。" +
       "state=waiting_for_input 时附带 question，需要用 fox_reply 回答任务才会继续；" +
-      "state=done/failed 时附带结构化结果摘要和完整轨迹日志路径。",
+      "state=done/failed 时附带结构化结果摘要（result）。任何状态都带 logPath（完整轨迹日志），" +
+      "怀疑任务假死时直接 tail 该文件：以 @@RESULT@@ 行结尾说明进程其实已经收尾。",
     inputSchema: {
       type: "object",
       properties: {
         taskId: { type: "string", description: "fox_submit 返回的任务 id" },
       },
       required: ["taskId"],
+    },
+  },
+  {
+    name: "fox_wait",
+    description:
+      "挂起等待 FoxAgent 任务出结果（推荐用它代替反复 fox_status 轮询）。" +
+      "任务完成/失败时返回结构化结果摘要（result），任务提问时立即返回 question（用 fox_reply 回答后可再 fox_wait）。" +
+      "等满 timeoutSec 任务还没跑完则返回 state=running——这是正常的续租信号，再调一次继续等即可。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "fox_submit 返回的任务 id" },
+        timeoutSec: {
+          type: "number",
+          description: "本次挂起最长等多少秒（默认 300，范围 5~570；需短于客户端的 MCP 工具超时）",
+        },
+      },
+      required: ["taskId"],
+    },
+  },
+  {
+    name: "fox_sessions",
+    description:
+      "列出某个项目目录的 FoxAgent 历史会话（按最近更新降序）：sessionId、起止时间、响应轮数、" +
+      "最近任务与最后一次回复的摘要。想接着之前的工作时先用它找到目标会话，再 fox_submit 传 session 续上——" +
+      "之前的分析上下文都还在。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string", description: "项目目录（会话按项目隔离存储），必须是绝对路径" },
+        limit: { type: "number", description: "最多返回几条（默认 10）" },
+      },
+      required: ["cwd"],
     },
   },
   {
@@ -127,6 +185,7 @@ function onStdoutChunk(t: FoxTask, chunk: string) {
       try {
         t.question = JSON.parse(line.slice("@@ASK@@".length));
         t.state = "waiting_for_input";
+        wake(t); // 挂起的 fox_wait 必须立即拿到 question，否则没人能 fox_reply，死锁
       } catch {
         appendOut(t, line + "\n"); // 解析不了就当普通输出，别吞
       }
@@ -143,7 +202,9 @@ function onStdoutChunk(t: FoxTask, chunk: string) {
   }
 }
 
-function submitTask(args: any): { ok: true; taskId: string; logPath: string } | { ok: false; message: string } {
+function submitTask(
+  args: any
+): { ok: true; taskId: string; logPath: string; tokenBudget?: number } | { ok: false; message: string } {
   const task = String(args?.task || "");
   const cwd = String(args?.cwd || "");
   if (!task || !cwd) return { ok: false, message: "缺少 task 或 cwd 参数" };
@@ -153,6 +214,29 @@ function submitTask(args: any): { ok: true; taskId: string; logPath: string } | 
     isDir = fs.statSync(cwd).isDirectory();
   } catch {}
   if (!isDir) return { ok: false, message: `工作目录不存在或不是目录：${cwd}` };
+  let maxIters: number | undefined;
+  if (args?.maxIters !== undefined) {
+    const v = Number(args.maxIters);
+    if (!Number.isInteger(v) || v < 1 || v > 10_000) {
+      return { ok: false, message: `maxIters 应为 1~10000 的整数：${args.maxIters}` };
+    }
+    maxIters = v;
+  }
+  let maxTokens: number | undefined;
+  if (args?.maxTokens !== undefined) {
+    const v = Number(args.maxTokens);
+    if (!Number.isInteger(v) || v < 10_000 || v > 1_000_000_000) {
+      return { ok: false, message: `maxTokens 应为 10000~1000000000 的整数：${args.maxTokens}` };
+    }
+    maxTokens = v;
+  }
+  // 本任务实际生效的预算，露给调用方核对（默认 = 窗口 × 5；config 读不到 env 时不带该字段）
+  let tokenBudget: number | undefined = maxTokens;
+  if (tokenBudget === undefined) {
+    try {
+      tokenBudget = loadConfig().maxTokens;
+    } catch {}
+  }
 
   const taskId = `t${Date.now().toString(36)}-${++taskSeq}`;
   // 轨迹放 FoxAgent 自己的数据目录（项目目录零污染，也不用操心 gitignore）
@@ -165,7 +249,12 @@ function submitTask(args: any): { ok: true; taskId: string; logPath: string } | 
   else if (args?.continueSession) cliArgs.push("--continue");
   const child = spawn("bun", cliArgs, {
     cwd,
-    env: { ...process.env },
+    // 预算/轮数走环境变量透传（config.ts 统一读，不另开参数通道）
+    env: {
+      ...process.env,
+      ...(maxIters ? { FOXAGENT_MAX_ITERS: String(maxIters) } : {}),
+      ...(maxTokens ? { FOXAGENT_MAX_TOKENS: String(maxTokens) } : {}),
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -176,6 +265,7 @@ function submitTask(args: any): { ok: true; taskId: string; logPath: string } | 
     lineBuf: "",
     logPath,
     log: fs.createWriteStream(logPath),
+    waiters: [],
   };
   tasks.set(taskId, t);
 
@@ -186,6 +276,7 @@ function submitTask(args: any): { ok: true; taskId: string; logPath: string } | 
     t.state = "failed";
     t.exitCode = 1;
     t.log.end();
+    wake(t);
   });
   child.on("close", (code) => {
     if (t.lineBuf) {
@@ -196,9 +287,10 @@ function submitTask(args: any): { ok: true; taskId: string; logPath: string } | 
     // 退出码语义（见 cli.ts）：0 = 有成果（含收尾翻车的部分成功），非 0 = 颗粒无收
     t.state = t.exitCode === 0 ? "done" : "failed";
     t.log.end();
+    wake(t);
   });
 
-  return { ok: true, taskId, logPath };
+  return { ok: true, taskId, logPath, tokenBudget };
 }
 
 function statusTask(taskId: string): any {
@@ -210,15 +302,50 @@ function statusTask(taskId: string): any {
   }
   const newOutput = t.pending.slice(0, STATUS_CHUNK);
   t.pending = t.pending.slice(newOutput.length);
-  const out: any = { state: t.state, newOutput };
+  // logPath 任何状态都给：运行中调用方可以直接 tail 判断是否假死（增量长时间为空 ≠ 挂了）
+  const out: any = { state: t.state, newOutput, logPath: t.logPath };
   if (t.pending.length > 0) out.hasMore = true; // 还有没取完的输出，马上再调一次
   if (t.state === "waiting_for_input" && t.question) out.question = t.question;
   if (t.state === "done" || t.state === "failed") {
     out.exitCode = t.exitCode;
     out.result = t.result ?? null;
-    out.logPath = t.logPath;
+    // 中断（循环上限/模型调用失败/被打断）→ 直接教怎么续，别让调用方误判为「跑完了」或「全失败」
+    if (typeof t.result?.outcome === "string" && t.result.outcome.startsWith("中断")) {
+      out.note =
+        "任务中途被中断（原因见 result.outcome）。要接着干：fox_submit 传 session=result.sessionId 续会话，" +
+        "任务描述里明确要求「基于已有分析收敛产出，不要重新大面积浏览」；预算不够就带上更大的 maxTokens。";
+    }
   }
   return out;
+}
+
+// 挂起直到任务跳出 running（完成/失败/提问），或等满 timeoutSec。
+// 返回格式与 fox_status 完全一致（含增量输出与终态 result）；超时时 state 仍是 running，
+// 调用方再调一次续等即可（续租模式：server 端超时要短于 MCP 客户端的工具超时）
+async function waitTask(taskId: string, timeoutSec: number): Promise<any> {
+  const t = tasks.get(taskId);
+  if (!t) {
+    return { error: `任务 ${taskId} 不存在（MCP 服务器可能重启过，任务表不持久化）` };
+  }
+  const deadline = Date.now() + timeoutSec * 1000;
+  while (t.state === "running" && Date.now() < deadline) {
+    await new Promise<void>((resolve) => {
+      // 定时醒一次兜底（防状态跳变时 wake 因异常路径漏发），到点或被 wake 都继续判断循环条件
+      const done = () => {
+        clearTimeout(timer);
+        const i = t.waiters.indexOf(done);
+        if (i >= 0) t.waiters.splice(i, 1); // 超时醒来时把自己摘掉，别在数组里越积越多
+        resolve();
+      };
+      const timer = setTimeout(done, Math.min(deadline - Date.now(), 10_000));
+      t.waiters.push(done);
+    });
+  }
+  const s = statusTask(taskId);
+  if (s.state === "running") {
+    s.note = `等待 ${timeoutSec} 秒后任务仍在运行（正常，长任务需要时间）。再调一次 fox_wait 续等即可。`;
+  }
+  return s;
 }
 
 function replyTask(taskId: string, answer: string): { ok: boolean; message: string } {
@@ -240,7 +367,19 @@ async function handleMessage(msg: any) {
       reply(id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "foxagent", version: "0.2.0" },
+        serverInfo: { name: "foxagent", version: "0.3.0" },
+        // server-level 使用要领：让任何项目目录、任何新 session 首次连上就自带完整用法
+        // （per-project 记忆传播不到别的目录，这里是跨项目唯一可靠渠道）
+        instructions:
+          "FoxAgent 使用要领：\n" +
+          "【写工单】任务描述给足背景：明确判定标准、「重点但不限于」的文件清单、「不要动 X」的边界。" +
+          "要在工作区外产出文件（报告等）时，在工单里提醒它用 run_command 重定向写（write_file 只能写工作区内）。\n" +
+          "【等待】两种模式按场景选：赶工用 fox_wait 挂起（超时返回 running 是续租信号，再调即可）；" +
+          "需要边等边处理别的事时改零占用模式——后台定时 grep 日志文件（fox_submit 返回的 logPath），" +
+          "出现 @@RESULT@@ 行即任务收尾，不占用你的回合。\n" +
+          "【续会话】跨 session 接续工作：先 fox_sessions 按 cwd 列历史会话（含最近任务与最后回复摘要），" +
+          "再 fox_submit 传 session=<id> 续上，旧分析上下文都在。续跑中断任务时在工单里要求" +
+          "「基于已有分析收敛产出，不要重新大面积浏览」。多任务并行必须用显式 session id，别用 continueSession（会串线）。",
       });
       break;
     case "notifications/initialized":
@@ -260,13 +399,42 @@ async function handleMessage(msg: any) {
           replyText(id, {
             taskId: r.taskId,
             logPath: r.logPath,
-            note: "任务已提交。用 fox_status 轮询进度；state=waiting_for_input 时需要 fox_reply 回答。",
+            ...(r.tokenBudget !== undefined ? { tokenBudget: r.tokenBudget } : {}),
+            note:
+              "任务已提交。赶工用 fox_wait 挂起等待（超时返回 running 就再调续等）；" +
+              "想边等边干别的就零占用等法：后台定时 grep 上面的 logPath，出现 @@RESULT@@ 行即收尾。" +
+              "state=waiting_for_input 时需要 fox_reply 回答。",
           });
           break;
         }
         case "fox_status": {
           const s = statusTask(String(args?.taskId || ""));
           replyText(id, s, !!s.error);
+          break;
+        }
+        case "fox_wait": {
+          // clamp 而非报错：等待时长是软约束，上限留在 MCP 客户端默认工具超时（600s）之内
+          const raw = Number(args?.timeoutSec);
+          const timeoutSec = Number.isFinite(raw) ? Math.min(Math.max(raw, 5), 570) : 300;
+          const s = await waitTask(String(args?.taskId || ""), timeoutSec);
+          replyText(id, s, !!s.error);
+          break;
+        }
+        case "fox_sessions": {
+          const cwd = String(args?.cwd || "");
+          if (!path.isAbsolute(cwd)) {
+            replyText(id, { error: `cwd 必须是绝对路径：${cwd}` }, true);
+            break;
+          }
+          const rawLimit = Number(args?.limit);
+          const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 10;
+          const sessions = summarizeSessions(cwd).slice(0, limit);
+          replyText(id, {
+            sessions,
+            ...(sessions.length === 0
+              ? { note: "该目录还没有任何 FoxAgent 会话（或路径拼写与当时干活的 cwd 不一致）" }
+              : {}),
+          });
           break;
         }
         case "fox_reply": {

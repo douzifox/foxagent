@@ -46,7 +46,11 @@ export async function compactIfNeeded(
   messages: ChatMessage[],
   opts: CompactOptions
 ): Promise<void> {
-  const budget = opts.numCtx * 0.7;
+  // 90% 水位才压（对齐 CC 的 auto-compact，决策 18）：压缩有损，原始细节尽量多留；
+  // DeepSeek 的上下文缓存把长历史重复发送的成本摊薄了，晚压缩不再昂贵。
+  // 该检查在每轮发送前执行，估算的 messages 就是即将发送的完整 prompt（上轮工具
+  // 输出已包含），天然是预测式判断——不存在"单轮大增量跳过水位线直发"的窗口
+  const budget = opts.numCtx * 0.9;
   if (estimateTokens(messages) < budget) return;
 
   const boundary = safeBoundary(messages, 6);

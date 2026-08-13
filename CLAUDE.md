@@ -1,13 +1,13 @@
 # FoxAgent 开发指引
 
-自制 coding agent，一套核心两张皮：终端 CLI（`src/cli.ts`）+ VS Code 插件（`src/extension.ts`）。
+自制 coding agent：终端 CLI（`src/cli.ts`）+ MCP 服务器（`src/mcp.ts`，供 Claude Code 等派活）。
 用户向说明见 README.md；本文件和 docs/ 是给开发者与 agent 看的。
+（VS Code 插件形态已于 2026-08-13 砍掉，见决策 20。）
 
 ## 常用命令
 
 ```bash
-bun run check        # 类型检查（改完必跑）
-bun run build        # 打包 VS Code 插件到 dist/（CLI 不需要构建，bun 直接跑 ts）
+bun run check        # 类型检查（改完必跑；无构建步骤，bun 直接跑 ts）
 bun run cli          # 当前目录跑 CLI
 bun src/cli.ts -p "任务"   # 非交互单任务（冒烟测试用这个）
 ```
@@ -28,8 +28,7 @@ FOXAGENT_HOST / FOXAGENT_API_KEY / FOXAGENT_MODEL，见 README）。
 | src/prompt.ts | 系统提示词组装 + 三块注入（全局指示/项目记忆索引/journal 全文） |
 | src/paths.ts | ~/.foxagent/ 数据布局的唯一定义 |
 | src/cli.ts | 终端入口（交互 + -p 非交互，-p 带哨兵协议 @@ASK@@/@@RESULT@@）；Esc 打断 / ↑ 取回队列 / Ctrl+C 退出 |
-| src/mcp.ts | MCP 服务器：fox_submit/fox_status/fox_reply 异步任务表，轨迹落 runs/ |
-| src/extension.ts + webviewContent.ts | VS Code 入口与聊天面板 |
+| src/mcp.ts | MCP 服务器：fox_submit/fox_wait/fox_status/fox_reply/fox_sessions 异步任务表，轨迹落 runs/ |
 
 ## 铁律（改代码前必读）
 
@@ -37,5 +36,5 @@ FOXAGENT_HOST / FOXAGENT_API_KEY / FOXAGENT_MODEL，见 README）。
 - 架构与数据流细节见 docs/architecture.md
 - 配置以环境变量为主（兜底见 config.ts）；密钥红线是绝不进项目目录（包括测试代码）
 - 内部消息统一 Ollama 风格（arguments 是对象），发送时才转 OpenAI 格式
-- 改完跑 `bun run check && bun run build`，再用 -p 模式冒烟一次
+- 改完跑 `bun run check`，再用 -p 模式冒烟一次
 - 提示词改动要实测：gemma4:26b 对复杂新规矩服从性差，写完必须验证它真的执行

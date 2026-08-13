@@ -1,6 +1,6 @@
 # FoxAgent 🦊
 
-自己的 coding agent。一套核心、两张皮：VS Code 插件 + 终端 CLI。
+自己的 coding agent。终端 CLI + MCP 服务器（供 Claude Code 等 agent 派活的小助手）。
 接任意 OpenAI 兼容接口（DeepSeek、各类网关、Ollama 的 /v1 端点）。
 
 - 六工具：搜代码、读文件、精确修改、新建文件、列目录、跑命令
@@ -14,7 +14,7 @@
 ## 配置
 
 以环境变量为主；缺失时兜底读 `~/.config/foxagent/env`（KEY=VALUE 每行一条，
-环境变量优先）——GUI 启动的进程（MCP 服务器、双击打开的 VS Code）读不到
+环境变量优先）——GUI 启动的进程（如 MCP 服务器）读不到
 shell 配置时靠它。密钥红线：不进项目目录。
 
 ```bash
@@ -23,11 +23,11 @@ export FOXAGENT_HOST=https://api.deepseek.com   # 或你的网关 /v1 地址
 export FOXAGENT_API_KEY=sk-xxx
 export FOXAGENT_MODEL=deepseek-v4-flash          # 模型名，见下方窗口约定
 
-# 可选
-export FOXAGENT_NUM_CTX=120000     # 覆盖默认的压缩阈值（见下方说明）
+# 可选（默认值都合理，一般不用设）
+export FOXAGENT_NUM_CTX=200000     # 压缩触发窗口（默认 200k；带 [1m] 的模型自动 1M）
 export FOXAGENT_TEMPERATURE=0.3
-export FOXAGENT_MAX_ITERS=25
-export FOXAGENT_FALLBACK_MODEL=deepseek-chat   # 上游重试耗尽后的备用模型
+export FOXAGENT_MAX_TOKENS=1000000 # 任务累计 token 预算（默认 = 窗口 × 5，不设即可）；80% 提醒收敛，耗尽硬断前留进展总结
+export FOXAGENT_MAX_ITERS=500      # 响应轮数上限，只防死循环（任务规模用 MAX_TOKENS 控制）
 ```
 
 ### 模型窗口约定
@@ -39,21 +39,13 @@ export FOXAGENT_MODEL=deepseek-v4-flash         # → 200k 窗口
 export FOXAGENT_MODEL=deepseek-v4-flash[1m]     # → 1M 窗口
 ```
 
-`[1m]` 在发给 API 前自动剥离，不影响请求。
-`FOXAGENT_NUM_CTX` 只覆盖默认值（200k）——带 `[1m]` 推断出 1M 时，以 1M 为准。
-压缩在窗口的 70% 处触发；窗口越大，压缩越晚，接口缓存命中越高。
-
-## VS Code 插件
-
-1. 用 VS Code 打开本目录，按 **F5**（自动构建并弹出插件调试窗口）
-2. 在调试窗口里**打开一个项目文件夹**
-3. 点左侧活动栏的狐狸图标，开聊
-4. 面板重新打开时自动接上上次会话；顶栏 ＋ 号开新会话
-5. 文件修改自动应用并在面板里展示红绿 diff；危险命令弹窗确认
-6. 干活时发送按钮变成「停止」可打断；继续输入会排队
-
-注意：Mac 上双击图标启动的 VS Code 读不到 shell 环境变量，
-请从终端用 `code` 命令启动（Windows 用系统环境变量则无此问题）。
+`[1m]` 在发给 API 前自动剥离，不影响请求。它是**整套 1M 模式的开关**：
+压缩窗口抬到 1M（压缩更晚、接口缓存命中更高），token 预算基数也是 1M
+（默认预算 = 窗口 × 5，即 5M）。`FOXAGENT_NUM_CTX` 只覆盖默认值（200k）——
+带 `[1m]` 时以 1M 为准。想要早压缩（强制提炼、每轮更快更省），
+用不带 `[1m]` 的模型名即可；此时默认预算为 200k × 5 = 1M，
+需要更大预算就显式设 `FOXAGENT_MAX_TOKENS`。实际生效的窗口和预算
+会显示在启动行里。
 
 ## 终端 CLI
 
@@ -95,10 +87,16 @@ claude mcp add --scope user foxagent -- bun ~/Cli/src/mcp.ts
 # 密钥三件套写进 ~/.claude.json 里 foxagent 的 env 字段，或用兜底文件
 ```
 
-三个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId）→
-`fox_status`（轮询增量输出；state=waiting_for_input 时带 question）→
-`fox_reply`（回答提问，任务继续）。任务表只在内存，MCP 服务器重启即失效。
-完整轨迹落在 `~/.foxagent/projects/<路径>/runs/<taskId>.log`。
+五个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId 和本任务
+token 预算 tokenBudget；大任务可带 `maxTokens` 调大预算）→ `fox_wait`（挂起等待结果，零轮询；等满
+timeoutSec 未完成则返回 running 续租信号，再调一次继续等；任务提问时立即
+返回 question）或 `fox_status`（轮询增量输出；任务中断结束时带续跑指引）
+→ `fox_reply`（回答提问，任务继续）；`fox_sessions`（列出项目的历史会话：
+最近任务、最后回复摘要、轮数——新调用方先用它找回会话再续上，跨 session 无缝接力）。
+任务表只在内存，MCP 服务器重启即失效。完整轨迹落在
+`~/.foxagent/projects/<路径>/runs/<taskId>.log`（fox_status 任何状态都返回该路径，
+怀疑假死直接 tail 它）。中断的任务用 `fox_submit` 传 `session=result.sessionId`
+续跑，之前的分析上下文还在。
 
 编译成单文件（不依赖 bun/node，拷走就能跑）：
 
@@ -122,13 +120,15 @@ bun run cli:compile:win    # 交叉编译 Windows → foxagent.exe
     runs/<taskId>.log                      MCP 任务的完整轨迹
 ```
 
-CLI 和插件读写同一份——终端开的工可以到编辑器里接着干。
+交互 CLI 和 -p/MCP 读写同一份会话——终端开的工，派任务续会话接着干。
 
 ## 上下文压缩
 
-每轮请求前估算用量，超过窗口 70% 时触发。趁历史完整（工具输出不预裁剪）
+每轮请求前估算用量，超过窗口 90% 时触发（对齐 CC 的 auto-compact——压缩有损，
+原始细节尽量多留，上下文缓存已摊薄长历史的重复成本）。趁历史完整（工具输出不预裁剪）
 让模型做一次全量总结，替换前段原文。压缩会使该轮接口缓存失效（已知代价），
-所以窗口越大、压缩越少、缓存越好——这是 `[1m]` 约定存在的原因。
+窗口越大、压缩越少、缓存越好——这是 `[1m]` 约定存在的原因；
+想要早压缩（强制提炼）就用不带 `[1m]` 的模型名。
 
 ## 记忆
 
@@ -167,11 +167,9 @@ CLI 和插件读写同一份——终端开的工可以到编辑器里接着干�
 
 ```bash
 bun install      # 装依赖
-bun run build    # 打包插件到 dist/
-bun run watch    # 监听改动自动打包
-bun run check    # 类型检查
+bun run check    # 类型检查（无构建步骤，bun 直接跑 ts）
 bun run cli      # 在当前目录跑 CLI
 ```
 
-改完必跑 `bun run check && bun run build`，再用 `-p` 模式冒烟一次。
+改完必跑 `bun run check`，再用 `-p` 模式冒烟一次。
 设计决策在 `docs/decisions.md`，架构在 `docs/architecture.md`。
