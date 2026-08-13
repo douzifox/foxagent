@@ -2,8 +2,8 @@
 // 密钥红线是不进项目目录；主目录配置可落盘（决策 4 修订）。
 // 必须：FOXAGENT_HOST、FOXAGENT_API_KEY、FOXAGENT_MODEL
 // 可选：FOXAGENT_NUM_CTX（压缩阈值，默认按模型窗口推断）、FOXAGENT_TEMPERATURE（默认 0.3）、
-//       FOXAGENT_MAX_TOKENS（任务累计 token 预算，默认 = 窗口 × 5，一般不用设——
-//       它同时是 MCP fox_submit maxTokens 参数的透传通道）、FOXAGENT_MAX_ITERS（防死循环兜底，默认 500）
+//       FOXAGENT_MAX_TOKENS（可选成本护栏，默认不限——它同时是 MCP fox_submit
+//       maxTokens 参数的透传通道）、FOXAGENT_MAX_ITERS（防死循环兜底，默认 500）
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -16,8 +16,8 @@ export interface FoxConfig {
   model: string; // 已剥离 [1m] 标注的干净模型名，可直接发给 API
   numCtx: number; // 压缩触发窗口（[1m] 时跟随抬到 1M，否则 200k / NUM_CTX 覆盖）
   temperature: number;
-  maxIters: number; // 防死循环兜底（主预算是 maxTokens）
-  maxTokens: number; // 任务累计 prompt token 预算（决策 16）
+  maxIters: number; // 防死循环兜底
+  maxTokens: number; // 可选成本护栏，默认 Infinity = 不限（决策 21）；显式设置时 80% 提醒 + 耗尽硬断
 }
 
 const DEFAULT_WINDOW = 200_000;
@@ -92,9 +92,10 @@ export function loadConfig(): FoxConfig {
     model: cleanModel,
     numCtx,
     temperature: num("FOXAGENT_TEMPERATURE", 0.3, 0, 2),
-    // 主预算按累计 token 计（决策 16），默认 = 模型真实窗口 × 5——换模型不用改配置，
-    // 也不随压缩窗口缩水。轮数只是防死循环兜底：低 token 死循环按预算烧不完，靠它拦
-    maxTokens: num("FOXAGENT_MAX_TOKENS", modelWindow * 5, 10_000, 1_000_000_000),
+    // 成本护栏默认不限（决策 21：「他的累计额度就是我的钱」，owner 成本自担，
+    // 限额反而掐死正常任务）。Infinity 让 agent 层的 80%/耗尽比较天然永不触发；
+    // 显式设置时护栏逻辑照旧。防死循环靠 maxIters 兜底
+    maxTokens: num("FOXAGENT_MAX_TOKENS", Infinity, 10_000, 1_000_000_000),
     maxIters: num("FOXAGENT_MAX_ITERS", 500, 1, 10_000),
   };
 }

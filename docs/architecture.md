@@ -10,10 +10,10 @@
       chatOnce（POST {host}/v1/chat/completions，流式 SSE）
       ├─ 模型返回 tool_calls → executeTool 逐个执行 → 结果 push 回 messages → 继续循环
       └─ 模型说话 → 结束本轮
-      （任务预算按累计 prompt token 计——优先 API usage 真值、缺失退回估算，
-        默认 = 窗口 × 5；消耗过 80% 注入收敛提醒，耗尽硬断。轮数上限只防死循环，
-        默认 500。两种硬断前都再给一次无工具的总结轮——进展总结进正式会话
-        并拼进 outcome，续会话时上下文完整）
+      （累计 prompt token 持续计量——优先 API usage 真值、缺失退回估算。
+        成本护栏默认不限（决策 21）；显式设 maxTokens 时消耗过 80% 注入收敛提醒、
+        耗尽硬断。轮数上限只防死循环，默认 500。两种硬断前都再给一次无工具的
+        总结轮——进展总结进正式会话并拼进 outcome，续会话时上下文完整）
   → 踩过坑（pitfalls 非空）→ wrapUp 收尾轮（历史副本，不进正式会话）
   → 返回 RoundResult { actions, pitfalls, outcome, committed }
   → 入口层：mergePending 累积 → committed 或会话切换/退出时 flushJournal

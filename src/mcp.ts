@@ -67,9 +67,9 @@ const TOOLS = [
         maxTokens: {
           type: "number",
           description:
-            "本任务的累计 token 消耗预算（默认 = 上下文窗口 × 5，实际值见提交返回的 tokenBudget）。" +
-            "消耗到 80% 会提醒模型收敛，耗尽则总结进展后中断。这是主要的任务规模旋钮。" +
-            "注意是软上限：提醒后放行的最后一轮可能超支（小预算下比例明显，实测可超 ~30%），设小预算时留余量",
+            "可选的成本护栏（默认不限，任务跑到自然完成）。显式设置后：累计消耗到 80% 提醒模型收敛，" +
+            "耗尽则总结进展后中断；软上限——提醒后放行的最后一轮可能超支 ~30%，设小值时留余量。" +
+            "返回的 tokenBudget 字段回显生效值（不限时无此字段）",
         },
         maxIters: {
           type: "number",
@@ -230,13 +230,14 @@ function submitTask(
     }
     maxTokens = v;
   }
-  // 本任务实际生效的预算，露给调用方核对（默认 = 窗口 × 5；config 读不到 env 时不带该字段）
+  // 本任务实际生效的预算，露给调用方核对（默认不限；Infinity 进不了 JSON，不带字段即表示不限）
   let tokenBudget: number | undefined = maxTokens;
   if (tokenBudget === undefined) {
     try {
       tokenBudget = loadConfig().maxTokens;
     } catch {}
   }
+  if (tokenBudget === Infinity) tokenBudget = undefined;
 
   const taskId = `t${Date.now().toString(36)}-${++taskSeq}`;
   // 轨迹放 FoxAgent 自己的数据目录（项目目录零污染，也不用操心 gitignore）
@@ -313,7 +314,7 @@ function statusTask(taskId: string): any {
     if (typeof t.result?.outcome === "string" && t.result.outcome.startsWith("中断")) {
       out.note =
         "任务中途被中断（原因见 result.outcome）。要接着干：fox_submit 传 session=result.sessionId 续会话，" +
-        "任务描述里明确要求「基于已有分析收敛产出，不要重新大面积浏览」；预算不够就带上更大的 maxTokens。";
+        "任务描述里明确要求「基于已有分析收敛产出，不要重新大面积浏览」；因护栏中断的话，调大或去掉 maxTokens 再续。";
     }
   }
   return out;

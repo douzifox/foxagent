@@ -26,7 +26,7 @@ export FOXAGENT_MODEL=deepseek-v4-flash          # 模型名，见下方窗口�
 # 可选（默认值都合理，一般不用设）
 export FOXAGENT_NUM_CTX=200000     # 压缩触发窗口（默认 200k；带 [1m] 的模型自动 1M）
 export FOXAGENT_TEMPERATURE=0.3
-export FOXAGENT_MAX_TOKENS=1000000 # 任务累计 token 预算（默认 = 窗口 × 5，不设即可）；80% 提醒收敛，耗尽硬断前留进展总结
+export FOXAGENT_MAX_TOKENS=1000000 # 可选成本护栏（默认不限）；设了才生效：80% 提醒收敛，耗尽硬断前留进展总结
 export FOXAGENT_MAX_ITERS=500      # 响应轮数上限，只防死循环（任务规模用 MAX_TOKENS 控制）
 ```
 
@@ -40,12 +40,10 @@ export FOXAGENT_MODEL=deepseek-v4-flash[1m]     # → 1M 窗口
 ```
 
 `[1m]` 在发给 API 前自动剥离，不影响请求。它是**整套 1M 模式的开关**：
-压缩窗口抬到 1M（压缩更晚、接口缓存命中更高），token 预算基数也是 1M
-（默认预算 = 窗口 × 5，即 5M）。`FOXAGENT_NUM_CTX` 只覆盖默认值（200k）——
-带 `[1m]` 时以 1M 为准。想要早压缩（强制提炼、每轮更快更省），
-用不带 `[1m]` 的模型名即可；此时默认预算为 200k × 5 = 1M，
-需要更大预算就显式设 `FOXAGENT_MAX_TOKENS`。实际生效的窗口和预算
-会显示在启动行里。
+压缩窗口抬到 1M（压缩更晚、接口缓存命中更高）。`FOXAGENT_NUM_CTX` 只覆盖
+默认值（200k）——带 `[1m]` 时以 1M 为准。想要早压缩（强制提炼、
+每轮更快更省），用不带 `[1m]` 的模型名即可。实际生效的窗口和护栏
+会显示在启动行里（护栏默认「不限」）。
 
 ## 终端 CLI
 
@@ -87,8 +85,8 @@ claude mcp add --scope user foxagent -- bun ~/Cli/src/mcp.ts
 # 密钥三件套写进 ~/.claude.json 里 foxagent 的 env 字段，或用兜底文件
 ```
 
-五个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId 和本任务
-token 预算 tokenBudget；大任务可带 `maxTokens` 调大预算）→ `fox_wait`（挂起等待结果，零轮询；等满
+五个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId；可带
+`maxTokens` 设成本护栏，默认不限）→ `fox_wait`（挂起等待结果，零轮询；等满
 timeoutSec 未完成则返回 running 续租信号，再调一次继续等；任务提问时立即
 返回 question）或 `fox_status`（轮询增量输出；任务中断结束时带续跑指引）
 → `fox_reply`（回答提问，任务继续）；`fox_sessions`（列出项目的历史会话：

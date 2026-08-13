@@ -26,8 +26,9 @@ const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 
-// 窗口/预算的可读格式：1_000_000 → 1M，200_000 → 200k
+// 窗口/预算的可读格式：1_000_000 → 1M，200_000 → 200k，Infinity → 不限
 function fmtTokens(n: number): string {
+  if (n === Infinity) return "不限";
   if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}M`;
   return `${Math.round(n / 1000)}k`;
 }
