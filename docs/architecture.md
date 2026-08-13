@@ -49,6 +49,8 @@ diff 展示走 `showEdit`（通知性，不阻塞），模型主动提问走 `as
 `-p` 模式与调用方之间用 stdout/stdin 走行协议：
 
 ```
+@@SESSION@@{sessionId}                            开工即上报会话 id（watchdog 终止时
+                                                  没有 @@RESULT@@，续跑全靠它）
 @@ASK@@{"type":"confirm"|"ask","question":...}   需要回答：危险命令确认 / ask 提问
                                                   ← stdin 一行回复（confirm 用 y/yes）
 @@RESULT@@{outcome, filesChanged, committed,      结束时的结构化摘要：
@@ -57,6 +59,7 @@ diff 展示走 `showEdit`（通知性，不阻塞），模型主动提问走 `as
 
 stdin 无人接（EOF）→ 确认当拒绝、提问当不在线，如实汇报。
 退出码：0 = 有成果（含收尾翻车的部分成功），1 = 颗粒无收。
+收到 SIGTERM（watchdog 终止）→ 补齐尾部 tool 配对后保存会话再退，续跑不丢进度。
 
 mcp.ts 把这层包成 MCP 五工具（按行 JSON 的 JSON-RPC，手写无 SDK）。
 initialize 返回 server-level instructions（使用要领：工单写法、两种等待模式、
@@ -73,6 +76,10 @@ result/question 恒全量；哨兵行转成 waiting_for_input 状态；任何状
 logPath 供调用方 tail 判断假死；result.outcome 以「中断」开头时附续跑指引
 note）→ `fox_reply`（写回子进程 stdin）；`fox_sessions`（列项目历史会话——session.ts summarizeSessions，
 含最近任务/最后回复摘要/轮数，供新调用方找回会话续聊）。
+server 内建 watchdog（决策 23）：running 且子进程输出静默超 5 分钟判定假死，
+合成疑似假死终态 result（error + 最后输出时间 + sessionId）并 SIGTERM
+（10s 不退 SIGKILL）；waiting_for_input 不计静默、fox_reply 后重新计时。
+调用方无论 fox_wait 还是哨兵 grep，只需等终态，无需自检。
 任务表仅内存，服务器进程没了任务即不存在。
 完整轨迹落 `runs/<taskId>.log`，MCP 端只回传增量与摘要。
 

@@ -68,10 +68,37 @@ async function runOnce(task: string, continueSession: boolean, sessionId?: strin
     process.exit(1);
   }
   if (!session) session = createSession();
+  // 开工即上报会话 id（哨兵行，mcp 解析后不进输出流）：假死被 watchdog 终止时
+  // 没有 @@RESULT@@，调用方全靠这行知道续跑该传哪个 session
+  process.stdout.write(`@@SESSION@@${JSON.stringify({ sessionId: session.id })}\n`);
   if (session.messages.length === 0) {
     session.messages.push({ role: "system", content: buildSystemPrompt(root) });
   }
   session.messages.push({ role: "user", content: task });
+
+  // watchdog（或调用方）SIGTERM 终止时尽量把会话保住，续跑才有东西可续。
+  // 尾部可能停在未配对的 assistant(tool_calls)——补上占位 tool 结果，否则续跑首轮请求 400
+  const sess = session;
+  process.on("SIGTERM", () => {
+    // 尾部形如 assistant(tool_calls) [+ 部分 tool 结果]——只补缺的那几个
+    let ai = sess.messages.length - 1;
+    while (ai >= 0 && sess.messages[ai].role === "tool") ai--;
+    const last = sess.messages[ai];
+    if (last?.role === "assistant" && last.tool_calls?.length) {
+      const answered = new Set(sess.messages.slice(ai + 1).map((m) => m.tool_call_id));
+      for (const call of last.tool_calls) {
+        if (answered.has(call.id)) continue;
+        sess.messages.push({
+          role: "tool",
+          tool_name: call.function?.name,
+          tool_call_id: call.id,
+          content: "（任务被 watchdog 终止，此调用未执行或未完成）",
+        });
+      }
+    }
+    saveSession(root, sess);
+    process.exit(1);
+  });
 
   // 哨兵问答通道：一行问题出去，一行回答进来。
   // 回答可能在提问之前就被写进 stdin（调用方抢跑）——先排队，问的时候按序取

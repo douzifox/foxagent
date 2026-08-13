@@ -22,6 +22,10 @@ const CLI_PATH = path.join(__dirname, "cli.ts");
 const STATUS_CHUNK = 8000; // verbose 模式单次最多带走的输出字符数（分页 + hasMore）
 const DEFAULT_TAIL = 1500; // 默认模式 newOutput 只回尾部这么多字符（决策 22：流水账灌上下文是调用方限流大头）
 const BUFFER_CAP = 200_000; // 未取走输出的内存上限，超出丢中间留两头（完整轨迹在日志文件）
+// watchdog 静默阈值（决策 23）：running 状态下子进程无任何输出超过这个时长判定假死。
+// 宁钝勿敏——模型单轮长思考（thinking 不打印）静默 1~2 分钟、工具最长 2 分钟都是正常的。
+// env 覆盖仅供测试用，不是用户配置
+const WATCHDOG_SILENCE = Number(process.env.FOXAGENT_WATCHDOG_MS) || 300_000;
 
 interface FoxTask {
   child: ChildProcess;
@@ -34,6 +38,8 @@ interface FoxTask {
   logPath: string;
   log: fs.WriteStream;
   waiters: (() => void)[]; // fox_wait 的挂起者，状态跳出 running 时全部唤醒
+  lastActivity: number; // 子进程最近一次输出的时刻（watchdog 假死判定用）
+  sessionId?: string; // @@SESSION@@ 哨兵上报——假死终止时没有 @@RESULT@@，全靠它给续跑指路
 }
 
 // 状态跳变（waiting_for_input / done / failed）时唤醒所有挂起的 fox_wait
@@ -88,8 +94,8 @@ const TOOLS = [
       "查询 FoxAgent 任务状态（长任务建议每 2~4 分钟查一次）。newOutput 默认只带增量输出的尾部约 1.5k" +
       "字符（省 token；被省略部分见 logPath），要全量传 verbose。" +
       "state=waiting_for_input 时附带 question（全量），需要用 fox_reply 回答任务才会继续；" +
-      "state=done/failed 时附带结构化结果摘要 result（全量）。任何状态都带 logPath（完整轨迹日志），" +
-      "怀疑任务假死时直接 tail 该文件：以 @@RESULT@@ 行结尾说明进程其实已经收尾。",
+      "state=done/failed 时附带结构化结果摘要 result（全量）。任何状态都带 logPath（完整轨迹日志）。" +
+      "假死不用调用方操心：server 内建 watchdog，子进程静默超 5 分钟自动终止并写终态（result 带续跑 sessionId）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -186,7 +192,14 @@ function onStdoutChunk(t: FoxTask, chunk: string) {
   while ((idx = t.lineBuf.indexOf("\n")) >= 0) {
     const line = t.lineBuf.slice(0, idx);
     t.lineBuf = t.lineBuf.slice(idx + 1);
-    if (line.startsWith("@@ASK@@")) {
+    if (line.startsWith("@@SESSION@@")) {
+      t.log.write(line + "\n");
+      try {
+        t.sessionId = JSON.parse(line.slice("@@SESSION@@".length)).sessionId;
+      } catch {
+        appendOut(t, line + "\n");
+      }
+    } else if (line.startsWith("@@ASK@@")) {
       t.log.write(line + "\n");
       try {
         t.question = JSON.parse(line.slice("@@ASK@@".length));
@@ -273,11 +286,18 @@ function submitTask(
     logPath,
     log: fs.createWriteStream(logPath),
     waiters: [],
+    lastActivity: Date.now(),
   };
   tasks.set(taskId, t);
 
-  child.stdout!.on("data", (d) => onStdoutChunk(t, d.toString("utf-8")));
-  child.stderr!.on("data", (d) => appendOut(t, d.toString("utf-8")));
+  child.stdout!.on("data", (d) => {
+    t.lastActivity = Date.now();
+    onStdoutChunk(t, d.toString("utf-8"));
+  });
+  child.stderr!.on("data", (d) => {
+    t.lastActivity = Date.now();
+    appendOut(t, d.toString("utf-8"));
+  });
   child.on("error", (e) => {
     appendOut(t, `启动子进程失败：${e.message}\n`);
     t.state = "failed";
@@ -383,8 +403,38 @@ function replyTask(taskId: string, answer: string): { ok: boolean; message: stri
   t.child.stdin!.write(answer + "\n");
   t.state = "running";
   t.question = undefined;
+  t.lastActivity = Date.now(); // 等人回答的时间不算静默，从答复起重新计时，防误杀
   return { ok: true, message: "已送达，任务继续执行" };
 }
+
+// watchdog（决策 23）：异常检测是 fox 本体的职责，不该靠每个调用方自己写脚本猜。
+// running 且静默超阈值 → 合成疑似假死的终态 result（带 sessionId 供续跑）并终止进程；
+// close 事件随后把 state 置 failed 并唤醒 fox_wait——调用方无论挂起还是 grep 哨兵，等终态即可。
+// waiting_for_input 不检测（等人回答不算假死）。
+setInterval(() => {
+  const now = Date.now();
+  for (const [, t] of tasks) {
+    if (t.state !== "running") continue;
+    if (now - t.lastActivity < WATCHDOG_SILENCE) continue;
+    const silentSec = Math.round((now - t.lastActivity) / 1000);
+    t.result = {
+      outcome:
+        `中断：疑似假死（子进程静默 ${silentSec} 秒，watchdog 已终止）。` +
+        `最后输出时间 ${new Date(t.lastActivity).toISOString()}，完整轨迹见日志。`,
+      filesChanged: [],
+      committed: false,
+      error: "watchdog：疑似假死，已终止进程",
+      sessionId: t.sessionId ?? null,
+    };
+    appendOut(t, `\n[watchdog] 子进程静默 ${silentSec} 秒，疑似假死，已终止\n`);
+    t.child.kill(); // SIGTERM：cli 侧会尽量保存会话再退；close 事件负责置 failed + wake
+    const tt = t;
+    setTimeout(() => {
+      // SIGTERM 后进程仍赖着不走（事件循环卡死）→ 强杀兜底
+      if (tt.state === "running") tt.child.kill("SIGKILL");
+    }, 10_000);
+  }
+}, Math.min(WATCHDOG_SILENCE / 2, 30_000));
 
 async function handleMessage(msg: any) {
   const { id, method, params } = msg;
@@ -402,7 +452,8 @@ async function handleMessage(msg: any) {
           "要在工作区外产出文件（报告等）时，在工单里提醒它用 run_command 重定向写（write_file 只能写工作区内）。\n" +
           "【等待】两种模式按场景选：赶工用 fox_wait 挂起（超时返回 running 是续租信号，再调即可）；" +
           "需要边等边处理别的事时改零占用模式——后台定时 grep 日志文件（fox_submit 返回的 logPath），" +
-          "出现 @@RESULT@@ 行即任务收尾，不占用你的回合。\n" +
+          "出现 @@RESULT@@ 行即任务收尾，不占用你的回合。两种等法都只需等终态：" +
+          "假死由 server 内建 watchdog 兜底（静默超 5 分钟自动终止并写终态），调用方不需要任何自检逻辑。\n" +
           "【验收】优先读它的产出文件和 result 摘要、需要细节时 grep logPath——" +
           "别依赖 newOutput 全量（默认只回尾部，为省你的上下文）。\n" +
           "【续会话】跨 session 接续工作：先 fox_sessions 按 cwd 列历史会话（含最近任务与最后回复摘要），" +

@@ -137,6 +137,16 @@
     终态 result 与 question 保持全量——价值密度高，是验收要用的；只瘦流水账。
     instructions 补验收指引：优先读产出文件/grep logPath，别依赖 newOutput 全量。
 
+23. **watchdog 内建到 MCP server**（2026-08-13，经 lvbc 转达拍板）
+    职责归属：异常检测在 fox 本体，不在调用方——「不该靠派单人的记忆和脚本」。
+    信号用子进程输出静默时长（mcp 侧最可靠的信号），阈值 5 分钟宁钝勿敏
+    （thinking 不打印、长思考静默 1~2 分钟 + 工具最长 2 分钟都正常）。
+    触发后合成疑似假死终态 result（error + 最后输出时间 + sessionId）并 SIGTERM，
+    10s 不退 SIGKILL 兜底；fox_wait 挂起者按正常终态唤醒，无新 state。
+    配套：新哨兵 @@SESSION@@（-p 开工即上报会话 id，假死时没有 @@RESULT@@ 全靠它）；
+    cli 收到 SIGTERM 补齐尾部 tool 配对并保存会话——续跑才有东西可续。
+    waiting_for_input 不计静默，fox_reply 后重新计时，防误杀。
+
 ## 待办（pi 借鉴清单，按价值排序）
 
 源码在需要时 clone badlogic/pi-mono，重点 packages/agent/src/harness/。
