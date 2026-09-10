@@ -28,7 +28,7 @@ FOXAGENT_HOST / FOXAGENT_API_KEY / FOXAGENT_MODEL，见 README）。
 | src/prompt.ts | 系统提示词组装 + 三块注入（全局指示/项目记忆索引/journal 全文） |
 | src/paths.ts | ~/.foxagent/ 数据布局的唯一定义 |
 | src/cli.ts | 终端入口（交互 + -p 非交互，-p 带哨兵协议 @@ASK@@/@@RESULT@@）；Esc 打断 / ↑ 取回队列 / Ctrl+C 退出 |
-| src/mcp.ts | MCP 服务器：fox_submit/fox_wait/fox_status/fox_reply/fox_sessions 异步任务表，轨迹落 runs/ |
+| src/mcp.ts | MCP 服务器：fox_submit/fox_wait/fox_check/fox_status/fox_reply/fox_sessions 异步任务表，轨迹落 runs/ |
 
 ## 铁律（改代码前必读）
 

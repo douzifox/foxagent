@@ -70,6 +70,9 @@ fox_sessions 续会话）——跨项目、跨 session 传播用法的唯一可�
 跳出 running 才返回，返回格式与 fox_status 一致；任务表里挂 waiters 回调，
 状态跳变点唤醒；等满 timeoutSec（默认 300，clamp 5~570，须短于客户端
 MCP 工具超时）返回 running + 续租 note，调用方再调一次续等）或
+`fox_check`（只看不取的快照，决策 24：不碰 pending，回运行秒数/静默秒数/工具调用次数/
+最后一次工具调用——从 cli 的 `[tool]` 行旁路截名字与一个目标字段并截到 80 字符；
+不传 taskId 回全表；终态只回 state 不带 result）或
 `fox_status`（增量输出默认只回尾部 1.5k 字符并标注省略量——流水账灌调用方
 上下文是限流大头，决策 22；verbose 全量 8k 分页 + hasMore，tailChars 自定义；
 result/question 恒全量；哨兵行转成 waiting_for_input 状态；任何状态都带
@@ -79,7 +82,7 @@ note）→ `fox_reply`（写回子进程 stdin）；`fox_sessions`（列项目�
 server 内建 watchdog（决策 23）：running 且子进程输出静默超 5 分钟判定假死，
 合成疑似假死终态 result（error + 最后输出时间 + sessionId）并 SIGTERM
 （10s 不退 SIGKILL）；waiting_for_input 不计静默、fox_reply 后重新计时。
-调用方无论 fox_wait 还是哨兵 grep，只需等终态，无需自检。
+调用方无论 fox_wait 还是 fox_check 轮看，只需等终态，无需自检。
 任务表仅内存，服务器进程没了任务即不存在。
 完整轨迹落 `runs/<taskId>.log`，MCP 端只回传增量与摘要。
 

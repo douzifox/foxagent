@@ -40,6 +40,10 @@ interface FoxTask {
   waiters: (() => void)[]; // fox_wait 的挂起者，状态跳出 running 时全部唤醒
   lastActivity: number; // 子进程最近一次输出的时刻（watchdog 假死判定用）
   sessionId?: string; // @@SESSION@@ 哨兵上报——假死终止时没有 @@RESULT@@，全靠它给续跑指路
+  // fox_check 快照用（决策 24）：从 stdout 的 [tool] 行截下来的最后一次工具调用，不动 pending
+  startedAt: number;
+  toolCalls: number;
+  lastTool?: { name: string; target: string; at: number };
 }
 
 // 状态跳变（waiting_for_input / done / failed）时唤醒所有挂起的 fox_wait
@@ -124,6 +128,20 @@ const TOOLS = [
         tailChars: { type: "number", description: "自定义 newOutput 尾部字符数（默认 1500，范围 200~100000）" },
       },
       required: ["taskId"],
+    },
+  },
+  {
+    name: "fox_check",
+    description:
+      "看任务快照，几十 token，不取走任何输出（与 fox_status 的区别：只看不取）。" +
+      "返回当前时间、已运行秒数、最后一次输出距今秒数、工具调用次数、最后一次工具调用（名字 + 目标）。" +
+      "长任务边等边干别的时用它判断是否正常推进（静默久 + 调用少 = 可能卡住）；" +
+      "不传 taskId 返回所有未清理任务的快照，并行派活时一次看全。终态只回 state，result 用 fox_status 取。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "fox_submit 返回的任务 id；不传 = 全部任务" },
+      },
     },
   },
   {
@@ -216,9 +234,26 @@ function onStdoutChunk(t: FoxTask, chunk: string) {
         appendOut(t, line + "\n");
       }
     } else {
-      appendOut(t, line + "\n");
+      if (line.startsWith("[tool] ")) noteToolLine(t, line);
+      appendOut(t, line + "\n"); // 照常进缓冲，快照只是旁路记一笔
     }
   }
+}
+
+// cli 每次工具调用打一行「[tool] name {args}」；只截名字和一个目标字段，截断到 80 字符。
+// 绝不回整个 args——write_file 的 args 是整个文件内容，回了就是 token 炸弹
+function noteToolLine(t: FoxTask, line: string) {
+  const rest = line.slice("[tool] ".length);
+  const sp = rest.indexOf(" ");
+  const name = sp < 0 ? rest : rest.slice(0, sp);
+  let target = "";
+  try {
+    const a = sp < 0 ? {} : JSON.parse(rest.slice(sp + 1));
+    target = String(a.path ?? a.command ?? a.pattern ?? a.question ?? "");
+  } catch {}
+  if (target.length > 80) target = target.slice(0, 80) + "…";
+  t.toolCalls++;
+  t.lastTool = { name, target, at: Date.now() };
 }
 
 function submitTask(
@@ -287,6 +322,8 @@ function submitTask(
     log: fs.createWriteStream(logPath),
     waiters: [],
     lastActivity: Date.now(),
+    startedAt: Date.now(),
+    toolCalls: 0,
   };
   tasks.set(taskId, t);
 
@@ -363,6 +400,43 @@ function statusTask(taskId: string, opts?: OutputOpts): any {
     }
   }
   return out;
+}
+
+// 只看不取的快照（决策 24）：不碰 pending，调用方看一眼几十 token 就能判断任务是否在正常推进。
+// 终态不带 result——快照的职责是「在不在动」，结果归 fox_status
+function hms(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function snapshot(taskId: string, t: FoxTask): any {
+  const now = Date.now();
+  const out: any = {
+    taskId,
+    state: t.state,
+    now: hms(now),
+    elapsedSec: Math.round((now - t.startedAt) / 1000),
+    lastActivityAt: hms(t.lastActivity),
+    silentSec: Math.round((now - t.lastActivity) / 1000),
+    toolCalls: t.toolCalls,
+  };
+  if (t.lastTool) {
+    out.lastTool = { name: t.lastTool.name, target: t.lastTool.target, at: hms(t.lastTool.at) };
+  }
+  if (t.state === "waiting_for_input") out.note = "任务在等回答，用 fox_status 看 question、fox_reply 回答";
+  if (t.state === "done" || t.state === "failed") out.note = "已结束，result 用 fox_status 取";
+  return out;
+}
+
+function checkTask(taskId?: string): any {
+  if (taskId) {
+    const t = tasks.get(taskId);
+    if (!t) return { error: `任务 ${taskId} 不存在（MCP 服务器可能重启过，任务表不持久化）` };
+    return snapshot(taskId, t);
+  }
+  const all = [...tasks.entries()].map(([id, t]) => snapshot(id, t));
+  return all.length ? { tasks: all } : { tasks: [], note: "当前没有任务" };
 }
 
 // 挂起直到任务跳出 running（完成/失败/提问），或等满 timeoutSec。
@@ -451,8 +525,8 @@ async function handleMessage(msg: any) {
           "【写工单】任务描述给足背景：明确判定标准、「重点但不限于」的文件清单、「不要动 X」的边界。" +
           "要在工作区外产出文件（报告等）时，在工单里提醒它用 run_command 重定向写（write_file 只能写工作区内）。\n" +
           "【等待】两种模式按场景选：赶工用 fox_wait 挂起（超时返回 running 是续租信号，再调即可）；" +
-          "需要边等边处理别的事时改零占用模式——后台定时 grep 日志文件（fox_submit 返回的 logPath），" +
-          "出现 @@RESULT@@ 行即任务收尾，不占用你的回合。两种等法都只需等终态：" +
+          "需要边等边处理别的事时用 fox_check 看快照（几十 token、只看不取，不传 taskId 一次看全所有任务），" +
+          "state 跳出 running 再 fox_status 取结果。两种等法都只需等终态：" +
           "假死由 server 内建 watchdog 兜底（静默超 5 分钟自动终止并写终态），调用方不需要任何自检逻辑。\n" +
           "【验收】优先读它的产出文件和 result 摘要、需要细节时 grep logPath——" +
           "别依赖 newOutput 全量（默认只回尾部，为省你的上下文）。\n" +
@@ -481,7 +555,7 @@ async function handleMessage(msg: any) {
             ...(r.tokenBudget !== undefined ? { tokenBudget: r.tokenBudget } : {}),
             note:
               "任务已提交。赶工用 fox_wait 挂起等待（超时返回 running 就再调续等）；" +
-              "想边等边干别的就零占用等法：后台定时 grep 上面的 logPath，出现 @@RESULT@@ 行即收尾。" +
+              "想边等边干别的就隔几分钟 fox_check 看快照（几十 token），state 跳出 running 再 fox_status 取结果。" +
               "state=waiting_for_input 时需要 fox_reply 回答。",
           });
           break;
@@ -502,6 +576,11 @@ async function handleMessage(msg: any) {
             verbose: args?.verbose === true,
             tailChars: args?.tailChars,
           });
+          replyText(id, s, !!s.error);
+          break;
+        }
+        case "fox_check": {
+          const s = checkTask(args?.taskId ? String(args.taskId) : undefined);
           replyText(id, s, !!s.error);
           break;
         }

@@ -147,6 +147,17 @@
     cli 收到 SIGTERM 补齐尾部 tool 配对并保存会话——续跑才有东西可续。
     waiting_for_input 不计静默，fox_reply 后重新计时，防误杀。
 
+24. **fox_check：只看不取的任务快照**（2026-09-10，小狐狸提议并拍板四条）
+    动机：两种等法各有洞——fox_wait 挂住主 agent 的回合，fox_status 哪怕只回尾部也几百 token，
+    且语义是「取走」，看一眼就清了缓冲。主 agent 的上下文是最贵的资源，缺一个几十 token 的「看一眼」。
+    返回：当前时间、已运行秒数、最后输出距今秒数、工具调用次数、最后一次工具调用（名字 + 目标）。
+    材料全是现成的：lastActivity（watchdog 已有）+ cli 打的 `[tool] name args` 行旁路截一笔。
+    拍板：① 新工具不做 fox_status 的 brief 参数——副作用不同（只看 vs 取走），两个名字模型不会用混；
+    ② 不传 taskId 返回全部任务，并行派活一次看全；③ lastTool 只取 path/command/pattern/question
+    里第一个非空字段并截到 80 字符，绝不回整个 args（write_file 的 args 是整个文件）；
+    ④ 终态不带 result——「都有快照了还做什么 result」，快照管「在不在动」，结果归 fox_status。
+    MCP 说明里原来教的「后台 grep 日志」零占用等法改为 fox_check。
+
 ## 待办（pi 借鉴清单，按价值排序）
 
 源码在需要时 clone badlogic/pi-mono，重点 packages/agent/src/harness/。

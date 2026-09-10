@@ -1,15 +1,30 @@
 # FoxAgent 🦊
 
-自己的 coding agent。终端 CLI + MCP 服务器（供 Claude Code 等 agent 派活的小助手）。
-接任意 OpenAI 兼容接口（DeepSeek、各类网关、Ollama 的 /v1 端点）。
+给主 agent 用的持久化执行层。
 
-- 六工具：搜代码、读文件、精确修改、新建文件、列目录、跑命令
-- 文件修改自动应用（红绿 diff 留痕），只有危险命令才弹确认
-- 流式输出（打字机式实时显示思考和回复）
-- 会话自动落盘可续聊，上下文快满时全量总结压缩
-- 两层记忆：全局指示 + 项目记忆（索引制，每条一个文件）
-- 工作档案：任务粒度自动记录，踩的坑重点标注，全文注入新会话
-- Esc 打断 / ↑ 取回队列 / Ctrl+C 退出 / `-p` 非交互模式
+你在用 Claude Code 之类的主 agent 干活，派了个子 agent 去读代码、试方案。它回来了，
+结果一半对一半错。这时候只有两条路：自己接手，那些本来隔离出去的文件全灌进主上下文；
+或者重派一个，它从零开始读，上一个的发现全丢。子 agent 死了，它脑子里的东西就没了。
+
+FoxAgent 的答案是子 agent 的会话不死。通过 MCP 派活给它，任务在它自己的会话里跑，
+主 agent 只拿回结构化结果和尾部输出。做错了就传 session id 续上，告诉它「X 错了 Y 对，
+基于已有分析收敛」，它改的是判断，不是重跑。
+
+- **上下文隔离**：脏活在 fox 会话里烧，主 agent 默认只收尾部 1.5k 字符加一份 result 摘要
+- **会话可续**：`fox_sessions` 找回历史会话，`fox_submit` 传 session 接着干，分析上下文都在
+- **成本分层**：fox 接任意 OpenAI 兼容接口，让便宜模型干流水账，贵模型只做判断
+- **不靠调用方兜底**：假死检测、token 预算、上下文压缩都在 fox 本体
+
+它也是一个能独立用的终端 CLI：七个工具、文件修改自动应用只有危险命令才确认、
+流式输出、会话落盘、两层记忆加自动工作档案。Bun + TypeScript 三千行，运行时依赖只有一个。
+
+设计取舍都记在 [docs/decisions.md](docs/decisions.md)，每条有理由、有被否掉的方案。
+
+## 前置
+
+- [Bun](https://bun.sh)
+- [ripgrep](https://github.com/BurntSushi/ripgrep)（`search` 工具靠它）
+- 任意 OpenAI 兼容接口的地址、密钥和模型名
 
 ## 配置
 
@@ -85,10 +100,12 @@ claude mcp add --scope user foxagent -- bun ~/Cli/src/mcp.ts
 # 密钥三件套写进 ~/.claude.json 里 foxagent 的 env 字段，或用兜底文件
 ```
 
-五个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId；可带
+六个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId；可带
 `maxTokens` 设成本护栏，默认不限）→ `fox_wait`（挂起等待结果，零轮询；等满
 timeoutSec 未完成则返回 running 续租信号，再调一次继续等；任务提问时立即
-返回 question）或 `fox_status`（轮询增量输出；任务中断结束时带续跑指引）
+返回 question）或 `fox_check`（只看不取的快照，几十 token：运行时长、静默秒数、
+工具调用次数、最后一次调用；不传 taskId 一次看全所有任务）或 `fox_status`
+（取走增量输出；任务中断结束时带续跑指引）
 → `fox_reply`（回答提问，任务继续）；`fox_sessions`（列出项目的历史会话：
 最近任务、最后回复摘要、轮数——新调用方先用它找回会话再续上，跨 session 无缝接力）。
 任务表只在内存，MCP 服务器重启即失效。完整轨迹落在
@@ -147,6 +164,9 @@ bun run cli:compile:win    # 交叉编译 Windows → foxagent.exe
 坑清单递给模型判断是否值得存进项目记忆。收尾对话不进正式会话历史。
 
 ## 安全
+
+定位是防手滑，不防对抗：危险命令靠正则黑名单拦，`find -delete`、`git branch -D` 这类绕得过去。
+文件修改自动应用，靠 git 兜底。别把它放进不信任的仓库里跑。
 
 - 路径锁定在工作区 + `~/.foxagent/`，重定向也必须过白名单
 - 工具参数 shell 转义防注入
