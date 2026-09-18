@@ -1,6 +1,6 @@
 {
   "name": "foxagent",
-  "description": "自己的 coding agent —— 终端 CLI + MCP 服务器，读代码、改代码、跑命令",
+  "description": "Persistent execution layer for your main coding agent: an MCP server with resumable sessions, plus a standalone terminal CLI",
   "version": "0.3.0",
   "private": true,
   "scripts": {

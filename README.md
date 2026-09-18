@@ -1,193 +1,233 @@
 # FoxAgent 🦊
 
-给主 agent 用的持久化执行层。
+English | [中文](README.zh-CN.md)
 
-你在用 Claude Code 之类的主 agent 干活，派了个子 agent 去读代码、试方案。它回来了，
-结果一半对一半错。这时候只有两条路：自己接手，那些本来隔离出去的文件全灌进主上下文；
-或者重派一个，它从零开始读，上一个的发现全丢。子 agent 死了，它脑子里的东西就没了。
+A persistent execution layer for your main coding agent.
 
-FoxAgent 的答案是子 agent 的会话不死。通过 MCP 派活给它，任务在它自己的会话里跑，
-主 agent 只拿回结构化结果和尾部输出。做错了就传 session id 续上，告诉它「X 错了 Y 对，
-基于已有分析收敛」，它改的是判断，不是重跑。
+You're working with a main agent like Claude Code. It spawns a sub-agent to read
+code and try an approach. The sub-agent comes back with a result that's half right,
+half wrong. Now you have two options: take over yourself, and every file that was
+supposed to stay isolated floods into the main context; or spawn a new sub-agent,
+which starts from zero and loses everything the previous one figured out. When a
+sub-agent dies, everything in its head dies with it.
 
-- **上下文隔离**：脏活在 fox 会话里烧，主 agent 默认只收尾部 1.5k 字符加一份 result 摘要
-- **会话可续**：`fox_sessions` 找回历史会话，`fox_submit` 传 session 接着干，分析上下文都在
-- **成本分层**：fox 接任意 OpenAI 兼容接口，让便宜模型干流水账，贵模型只做判断
-- **不靠调用方兜底**：假死检测、token 预算、上下文压缩都在 fox 本体
+FoxAgent's answer: the sub-agent's session doesn't die. Dispatch work to it over
+MCP, the task runs in its own session, and the main agent only gets back a
+structured result plus the tail of the output. If it got something wrong, pass the
+session id and tell it "X was wrong, Y is right, converge on what you already
+found." It revises its judgment instead of redoing the work.
 
-它也是一个能独立用的终端 CLI：七个工具、文件修改自动应用只有危险命令才确认、
-流式输出、会话落盘、两层记忆加自动工作档案。Bun + TypeScript 三千行，运行时依赖只有一个。
+- **Context isolation**: the dirty work burns in fox's session; by default the main agent receives only the last 1.5k characters plus a result summary
+- **Resumable sessions**: `fox_sessions` finds past sessions, `fox_submit` with a session id continues one, and all the prior analysis is still there
+- **Cost tiering**: fox talks to any OpenAI-compatible API, so a cheap model does the grind and the expensive one only makes decisions
+- **No caller-side babysitting**: hang detection, token budget, and context compaction all live inside fox
 
-设计取舍都记在 [docs/decisions.md](docs/decisions.md)，每条有理由、有被否掉的方案。
+It's also a standalone terminal CLI: seven tools, file edits applied automatically
+with confirmation only for dangerous commands, streaming output, sessions saved to
+disk, two layers of memory plus an automatic work journal. Bun + TypeScript, about
+3,000 lines, one runtime dependency.
 
-## 前置
+Every design trade-off is recorded in [docs/decisions.md](docs/decisions.md)
+(in Chinese), each with its reasoning and the alternatives that were rejected.
 
-- [Bun](https://bun.sh)
-- [ripgrep](https://github.com/BurntSushi/ripgrep)（`search` 工具靠它）
-- 任意 OpenAI 兼容接口的地址、密钥和模型名
+## Install
 
-## 配置
-
-以环境变量为主；缺失时兜底读 `~/.config/foxagent/env`（KEY=VALUE 每行一条，
-环境变量优先）——GUI 启动的进程（如 MCP 服务器）读不到
-shell 配置时靠它。密钥红线：不进项目目录。
+Prerequisites: [Bun](https://bun.sh), [ripgrep](https://github.com/BurntSushi/ripgrep)
+(the `search` tool depends on it), and the URL, key, and model name of any
+OpenAI-compatible API.
 
 ```bash
-# 必须（写进 ~/.zshrc 或 Windows 系统环境变量）
-export FOXAGENT_HOST=https://api.deepseek.com   # 或你的网关 /v1 地址
+git clone https://github.com/douzifox/foxagent.git ~/foxagent
+cd ~/foxagent && bun install
+```
+
+Commands below assume the clone lives at `~/foxagent`; adjust the path if you put it elsewhere.
+
+## Configuration
+
+Environment variables come first; if they're missing, `~/.config/foxagent/env` is
+read as a fallback (one `KEY=VALUE` per line, environment variables take
+precedence). The fallback exists for processes launched from a GUI (such as the MCP
+server) that can't see your shell config. Hard rule for secrets: they never go into
+the project directory.
+
+```bash
+# Required (put in ~/.zshrc, or Windows system environment variables)
+export FOXAGENT_HOST=https://api.deepseek.com   # or your gateway's /v1 URL
 export FOXAGENT_API_KEY=sk-xxx
-export FOXAGENT_MODEL=deepseek-v4-flash          # 模型名，见下方窗口约定
+export FOXAGENT_MODEL=deepseek-v4-flash          # model name, see window convention below
 
-# 可选（默认值都合理，一般不用设）
-export FOXAGENT_NUM_CTX=200000     # 压缩触发窗口（默认 200k；带 [1m] 的模型自动 1M）
+# Optional (defaults are sensible, usually no need to set)
+export FOXAGENT_NUM_CTX=200000     # compaction trigger window (default 200k; models tagged [1m] get 1M automatically)
 export FOXAGENT_TEMPERATURE=0.3
-export FOXAGENT_MAX_TOKENS=1000000 # 可选成本护栏（默认不限）；设了才生效：80% 提醒收敛，耗尽硬断前留进展总结
-export FOXAGENT_MAX_ITERS=500      # 响应轮数上限，只防死循环（任务规模用 MAX_TOKENS 控制）
+export FOXAGENT_MAX_TOKENS=1000000 # optional cost guardrail (unlimited by default); only active when set: warns to wrap up at 80%, writes a progress summary before the hard stop
+export FOXAGENT_MAX_ITERS=500      # cap on response rounds, only guards against infinite loops (use MAX_TOKENS to bound task size)
 ```
 
-### 模型窗口约定
+### Model window convention
 
-模型名默认按 **200k** 窗口处理。1M 窗口的模型加 `[1m]` 后缀：
+A model name is treated as a **200k** window by default. Append `[1m]` for models
+with a 1M window:
 
 ```bash
-export FOXAGENT_MODEL=deepseek-v4-flash         # → 200k 窗口
-export FOXAGENT_MODEL=deepseek-v4-flash[1m]     # → 1M 窗口
+export FOXAGENT_MODEL=deepseek-v4-flash         # → 200k window
+export FOXAGENT_MODEL=deepseek-v4-flash[1m]     # → 1M window
 ```
 
-`[1m]` 在发给 API 前自动剥离，不影响请求。它是**整套 1M 模式的开关**：
-压缩窗口抬到 1M（压缩更晚、接口缓存命中更高）。`FOXAGENT_NUM_CTX` 只覆盖
-默认值（200k）——带 `[1m]` 时以 1M 为准。想要早压缩（强制提炼、
-每轮更快更省），用不带 `[1m]` 的模型名即可。实际生效的窗口和护栏
-会显示在启动行里（护栏默认「不限」）。
+`[1m]` is stripped before the request goes to the API. It's the **switch for the
+whole 1M mode**: the compaction window rises to 1M (compaction happens later, API
+cache hits go up). `FOXAGENT_NUM_CTX` only overrides the default (200k); with `[1m]`
+present, 1M wins. If you want earlier compaction (forced distillation, faster and
+cheaper per round), just use the model name without `[1m]`. The effective window and
+guardrail are shown on the startup line (guardrail shows "unlimited" by default).
 
-## 终端 CLI
+## Terminal CLI
 
 ```bash
-cd 你的项目
-bun ~/Cli/src/cli.ts             # 默认继续该项目最近一次会话
-bun ~/Cli/src/cli.ts --new       # 开新会话
+cd your-project
+bun ~/foxagent/src/cli.ts             # continues the project's most recent session by default
+bun ~/foxagent/src/cli.ts --new       # start a new session
 
-# 会话内命令
-/new          开新会话
-/sessions     列出历史会话
-/resume <id>  恢复指定会话
-/exit         退出
+# In-session commands
+/new          start a new session
+/sessions     list past sessions
+/resume <id>  resume a specific session
+/exit         quit
 
-# 操作
-Esc           打断当前轮（会话保留）
-Ctrl+C        退出（自动保存）
-↑             干活时取回队列消息修改
-输入回车      干活时排队，本轮结束后自动发送
+# Controls
+Esc           interrupt the current turn (session is kept)
+Ctrl+C        quit (auto-saves)
+↑             while working, pull a queued message back to edit it
+Enter         while working, queue the message; it's sent when the turn ends
 
-# 非交互模式（供其他 agent 调用）
-bun src/cli.ts -p "任务描述"                 # 干完退出
-bun src/cli.ts -p "后续指令" --continue       # 续最近会话
-bun src/cli.ts -p "后续指令" --session <id>   # 续指定会话（并行任务不串线）
+# Non-interactive mode (for other agents to call)
+bun src/cli.ts -p "task description"              # run to completion and exit
+bun src/cli.ts -p "follow-up" --continue          # continue the most recent session
+bun src/cli.ts -p "follow-up" --session <id>      # continue a specific session (parallel tasks don't cross wires)
 ```
 
-`-p` 模式与调用方双向沟通：危险命令确认、模型的 ask 提问会打一行
-`@@ASK@@{...}` 到 stdout 并等 stdin 一行回复（没人接就当拒绝/不在线）。
-结束时输出一行 `@@RESULT@@{outcome, filesChanged, committed, error, sessionId}`
-结构化摘要——成果与事故分开呈现。退出码：0 = 有成果（包括干完活才翻车的
-部分成功），1 = 颗粒无收。
+`-p` mode talks to the caller in both directions: dangerous-command confirmations
+and the model's ask questions print one line of `@@ASK@@{...}` to stdout and wait
+for one line of reply on stdin (no one listening counts as refused / offline). On
+finish it prints one line of `@@RESULT@@{outcome, filesChanged, committed, error,
+sessionId}`, a structured summary that keeps results and accidents separate. Exit
+code: 0 = something was produced (including partial success where it crashed after
+finishing the work), 1 = nothing at all.
 
-## MCP 服务器（被 Claude Code 等指挥）
+## MCP server (driven by Claude Code and others)
 
-注册成全局 MCP 后，任何 MCP 客户端都能派活给 FoxAgent：
+Registered as a global MCP server, any MCP client can dispatch work to FoxAgent:
 
 ```bash
-claude mcp add --scope user foxagent -- bun ~/Cli/src/mcp.ts
-# 密钥三件套写进 ~/.claude.json 里 foxagent 的 env 字段，或用兜底文件
+claude mcp add --scope user foxagent -- bun ~/foxagent/src/mcp.ts
+# put the three secrets in the env field of the foxagent entry in ~/.claude.json, or use the fallback file
 ```
 
-六个工具组成异步任务模型：`fox_submit`（提交立即返回 taskId；可带
-`maxTokens` 设成本护栏，默认不限）→ `fox_wait`（挂起等待结果，零轮询；等满
-timeoutSec 未完成则返回 running 续租信号，再调一次继续等；任务提问时立即
-返回 question）或 `fox_check`（只看不取的快照，几十 token：运行时长、静默秒数、
-工具调用次数、最后一次调用；不传 taskId 一次看全所有任务）或 `fox_status`
-（取走增量输出；任务中断结束时带续跑指引）
-→ `fox_reply`（回答提问，任务继续）；`fox_sessions`（列出项目的历史会话：
-最近任务、最后回复摘要、轮数——新调用方先用它找回会话再续上，跨 session 无缝接力）。
-任务表只在内存，MCP 服务器重启即失效。完整轨迹落在
-`~/.foxagent/projects/<路径>/runs/<taskId>.log`（fox_status 任何状态都返回该路径，
-怀疑假死直接 tail 它）。中断的任务用 `fox_submit` 传 `session=result.sessionId`
-续跑，之前的分析上下文还在。
+Six tools make up an async task model: `fox_submit` (returns a taskId immediately;
+optionally takes `maxTokens` as a cost guardrail, unlimited by default) → `fox_wait`
+(blocks until the result, zero polling; if timeoutSec passes without completion it
+returns a running signal to renew the lease, call again to keep waiting; returns
+question immediately when the task asks something) or `fox_check` (a look-only
+snapshot, a few dozen tokens: runtime, seconds of silence, tool call count, last
+call; omit taskId to see every task at once) or `fox_status` (takes the incremental
+output; when a task ends interrupted it includes resume guidance) → `fox_reply`
+(answer a question, task continues); `fox_sessions` (lists the project's past
+sessions: latest task, last reply summary, round count. A new caller uses it to find
+a session before resuming, seamless handoff across sessions). The task table lives
+only in memory; restarting the MCP server drops it. The full trace lands in
+`~/.foxagent/projects/<path>/runs/<taskId>.log` (`fox_status` returns that path in
+every state; if you suspect a hang, just tail it). Resume an interrupted task with
+`fox_submit` and `session=result.sessionId`; the prior analysis context is still there.
 
-编译成单文件（不依赖 bun/node，拷走就能跑）：
+Compile to a single file (no bun/node needed, copy and run):
 
 ```bash
-bun run cli:compile        # 当前平台 → ./foxagent
-bun run cli:compile:win    # 交叉编译 Windows → foxagent.exe
+bun run cli:compile        # current platform → ./foxagent
+bun run cli:compile:win    # cross-compile for Windows → foxagent.exe
 ```
 
-## 数据存储
+## Data storage
 
-所有数据集中在 `~/.foxagent/`，项目目录零污染：
+Everything lives under `~/.foxagent/`, nothing is written into your project directory:
 
 ```
 ~/.foxagent/
-  FOXAGENT.md                              全局指示（跨项目，全文注入）
-  projects/<项目路径>/
-    sessions/<id>.json                     会话（含 thinking、journal 暂存）
-    memory/MEMORY.md                       项目记忆索引（注入）
-    memory/<slug>.md                       每条记忆一个文件（按需读）
-    journal.md                             工作档案（全文注入）
-    runs/<taskId>.log                      MCP 任务的完整轨迹
+  FOXAGENT.md                              global instructions (cross-project, injected in full)
+  projects/<project-path>/
+    sessions/<id>.json                     sessions (with thinking and journal staging)
+    memory/MEMORY.md                       project memory index (injected)
+    memory/<slug>.md                       one file per memory (read on demand)
+    journal.md                             work journal (injected in full)
+    runs/<taskId>.log                      full trace of MCP tasks
 ```
 
-交互 CLI 和 -p/MCP 读写同一份会话——终端开的工，派任务续会话接着干。
+The interactive CLI and -p/MCP read and write the same sessions: work started in the
+terminal can be continued by dispatching a task with that session.
 
-## 上下文压缩
+## Context compaction
 
-每轮请求前估算用量，超过窗口 90% 时触发（对齐 CC 的 auto-compact——压缩有损，
-原始细节尽量多留，上下文缓存已摊薄长历史的重复成本）。趁历史完整（工具输出不预裁剪）
-让模型做一次全量总结，替换前段原文。压缩会使该轮接口缓存失效（已知代价），
-窗口越大、压缩越少、缓存越好——这是 `[1m]` 约定存在的原因；
-想要早压缩（强制提炼）就用不带 `[1m]` 的模型名。
+Usage is estimated before each request; compaction triggers past 90% of the window
+(aligned with Claude Code's auto-compact: compaction is lossy, so keep as much raw
+detail as possible, and context caching has already amortized the cost of long
+history). While the history is still complete (tool output is never pre-trimmed),
+the model produces one full summary that replaces the earlier text. Compaction
+invalidates the API cache for that round (a known cost); the bigger the window, the
+less compaction and the better the cache hits. That's why the `[1m]` convention
+exists; if you want early compaction (forced distillation), use the model name
+without `[1m]`.
 
-## 记忆
+## Memory
 
-- **全局指示** `~/.foxagent/FOXAGENT.md`：跨项目的偏好和要求，全文注入每次会话
-- **项目记忆** `~/.foxagent/projects/<路径>/memory/`：每条一个 md 文件（带
-  name/description/type 元数据头），`MEMORY.md` 是索引。新会话只注入索引，
-  详情按 description 判断相关后自己读。写前查重更新，过时会删。全部纯文本可手改
+- **Global instructions** `~/.foxagent/FOXAGENT.md`: cross-project preferences and requirements, injected in full into every session
+- **Project memory** `~/.foxagent/projects/<path>/memory/`: one md file per memory (with a name/description/type metadata header), `MEMORY.md` is the index. A new session only gets the index injected; the agent reads details itself when the description looks relevant. It checks for duplicates before writing and deletes stale entries. All plain text, edit by hand freely
 
-## 工作档案
+## Work journal
 
-每个**任务**（不是每轮对话）结束后由代码自动追加到 `journal.md`：
-时间、任务、改动（同文件合并计数）、命令（限量）、坑（失败操作+错误信息）、
-结果。成功 `git commit` 或会话切换/退出时落盘。新会话全文注入。
+After every **task** (not every conversational turn), code appends to `journal.md`
+automatically: time, task, changes (merged per file with counts), commands (capped),
+pitfalls (failed operations plus error messages), result. Flushed on a successful
+`git commit` or when the session switches or exits. Injected in full into new sessions.
 
-## 收尾沉淀
+## Wrap-up
 
-任务中踩过坑时（编辑失败、命令非零退出），代码自动追加一次收尾请求：
-坑清单递给模型判断是否值得存进项目记忆。收尾对话不进正式会话历史。
+When a task hit pitfalls (failed edits, non-zero command exits), code automatically
+appends one wrap-up request: the pitfall list is handed to the model to decide whether
+it's worth saving to project memory. The wrap-up exchange is not added to the formal
+session history.
 
-## 安全
+## Security
 
-定位是防手滑，不防对抗：危险命令靠正则黑名单拦，`find -delete`、`git branch -D` 这类绕得过去。
-文件修改自动应用，靠 git 兜底。别把它放进不信任的仓库里跑。
+The goal is to catch slips, not to resist an adversary: dangerous commands are caught
+by a regex blocklist, and things like `find -delete` or `git branch -D` slip through.
+File edits are applied automatically, with git as the safety net. Don't run it in a
+repository you don't trust.
 
-- 路径锁定在工作区 + `~/.foxagent/`，重定向也必须过白名单
-- 工具参数 shell 转义防注入
-- 危险命令分级拦截（rm/sudo/git push 等），清单在 `tools.ts` 可调
-- edit 的行号污染检测（模型把显示用的行号前缀抄进替换内容时自动报错纠正）
-- 会话原子写（临时文件+rename），单文件损坏不影响其他会话
-- 终端输出 ANSI 净化（防模型返回控制序列操纵终端）
-- `-p` 模式危险命令走 `@@ASK@@` 哨兵问调用方，回 y 才执行；没人接（stdin 已关）视为拒绝
+- Paths are locked to the workspace plus `~/.foxagent/`; redirects must pass the allowlist too
+- Tool arguments are shell-escaped against injection
+- Dangerous commands are tiered and intercepted (rm / sudo / git push, etc.); the list in `tools.ts` is adjustable
+- Line-number contamination detection in edit (when the model copies the display line-number prefix into replacement text, it errors out and self-corrects)
+- Atomic session writes (temp file + rename), one corrupted file doesn't affect other sessions
+- ANSI sanitization of terminal output (guards against the model returning control sequences that manipulate the terminal)
+- In `-p` mode, dangerous commands go through the `@@ASK@@` sentinel to the caller and only run on a `y`; no listener (stdin closed) counts as refused
 
-## 提示词
+## Prompt
 
-默认提示词在 `src/prompt.ts`。被操作项目根目录放 `system-prompt.md` 可覆盖——
-调教不用改代码，改完开个新会话生效。
+The default prompt lives in `src/prompt.ts`. Put a `system-prompt.md` in the root of
+the project being operated on to override it: tuning without touching code, takes
+effect in the next new session.
 
-## 开发
+## Development
 
 ```bash
-bun install      # 装依赖
-bun run check    # 类型检查（无构建步骤，bun 直接跑 ts）
-bun run cli      # 在当前目录跑 CLI
+bun install      # install dependencies
+bun run check    # type check (no build step, bun runs ts directly)
+bun run cli      # run the CLI in the current directory
 ```
 
-改完必跑 `bun run check`，再用 `-p` 模式冒烟一次。
-设计决策在 `docs/decisions.md`，架构在 `docs/architecture.md`。
+After changes, always run `bun run check`, then do a smoke test in `-p` mode.
+Design decisions are in `docs/decisions.md`, architecture in `docs/architecture.md`
+(both in Chinese).
+
+## License
+
+[MIT](LICENSE)

@@ -1,7 +1,7 @@
 # FoxAgent 开发指引
 
 自制 coding agent：终端 CLI（`src/cli.ts`）+ MCP 服务器（`src/mcp.ts`，供 Claude Code 等派活）。
-用户向说明见 README.md；本文件和 docs/ 是给开发者与 agent 看的。
+用户向说明见 README.md（英文）/ README.zh-CN.md（中文，一手版本，改完同步英文）；本文件和 docs/ 是给开发者与 agent 看的。
 （VS Code 插件形态已于 2026-08-13 砍掉，见决策 20。）
 
 ## 常用命令
