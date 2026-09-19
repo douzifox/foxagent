@@ -2,7 +2,12 @@
 
 English | [中文](README.zh-CN.md)
 
-A persistent execution layer for your main coding agent.
+FoxAgent is a standalone coding agent that runs on any OpenAI-compatible model
+(DeepSeek, a local model, whatever is cheap) and plugs into Claude Code as an MCP
+server. Claude Code keeps making the decisions; FoxAgent does the grind — code
+review, exploration, mechanical edits — in its own persistent session, with a clean
+context and a different model's eyes. It is not another Claude process. It is a
+second, cheaper worker that can look at Claude's work from the outside.
 
 You're working with a main agent like Claude Code. It spawns a sub-agent to read
 code and try an approach. The sub-agent comes back with a result that's half right,
@@ -17,6 +22,7 @@ structured result plus the tail of the output. If it got something wrong, pass t
 session id and tell it "X was wrong, Y is right, converge on what you already
 found." It revises its judgment instead of redoing the work.
 
+- **A second pair of eyes**: fox is a different model with a clean context, so it doesn't share Claude's blind spots — a code review dispatched to fox is a real second opinion, not Claude grading its own homework
 - **Context isolation**: the dirty work burns in fox's session; by default the main agent receives only the last 1.5k characters plus a result summary
 - **Resumable sessions**: `fox_sessions` finds past sessions, `fox_submit` with a session id continues one, and all the prior analysis is still there
 - **Cost tiering**: fox talks to any OpenAI-compatible API, so a cheap model does the grind and the expensive one only makes decisions

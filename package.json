@@ -1,6 +1,6 @@
 {
   "name": "foxagent",
-  "description": "Persistent execution layer for your main coding agent: an MCP server with resumable sessions, plus a standalone terminal CLI",
+  "description": "Standalone coding agent on any OpenAI-compatible model, plugged into Claude Code via MCP: a cheaper second worker with a clean context — code review by a different model, persistent resumable sessions, cost tiering. Bun + TypeScript.",
   "version": "0.3.0",
   "private": true,
   "scripts": {

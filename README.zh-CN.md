@@ -2,7 +2,10 @@
 
 [English](README.md) | 中文
 
-给主 agent 用的持久化执行层。
+FoxAgent 是一个独立的 coding agent，跑在任意 OpenAI 兼容的模型上（DeepSeek、本地模型，
+哪个便宜用哪个），通过 MCP 接进 Claude Code。Claude Code 继续做决策，FoxAgent 干重活——
+code review、读代码、机械修改——在它自己的持久会话里，上下文干净，眼睛也不是 Claude 的。
+它不是再开一个 Claude，是一个更便宜的第二个工人，能从外面看 Claude 干的活。
 
 你在用 Claude Code 之类的主 agent 干活，派了个子 agent 去读代码、试方案。它回来了，
 结果一半对一半错。这时候只有两条路：自己接手，那些本来隔离出去的文件全灌进主上下文；
@@ -12,6 +15,7 @@ FoxAgent 的答案是子 agent 的会话不死。通过 MCP 派活给它，任�
 主 agent 只拿回结构化结果和尾部输出。做错了就传 session id 续上，告诉它「X 错了 Y 对，
 基于已有分析收敛」，它改的是判断，不是重跑。
 
+- **第二双眼睛**：fox 是另一个模型、干净的上下文，不跟 Claude 共享盲点。把 code review 派给 fox 是真正的第二意见，不是 Claude 给自己的作业打分
 - **上下文隔离**：脏活在 fox 会话里烧，主 agent 默认只收尾部 1.5k 字符加一份 result 摘要
 - **会话可续**：`fox_sessions` 找回历史会话，`fox_submit` 传 session 接着干，分析上下文都在
 - **成本分层**：fox 接任意 OpenAI 兼容接口，让便宜模型干流水账，贵模型只做判断
